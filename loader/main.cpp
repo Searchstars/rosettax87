@@ -690,7 +690,7 @@ int main(int argc, char *argv[]) {
 			const uint64_t x7 = dbg.readRegister(hitThread, MuhDebugger::Register::X7);
 			const uint64_t x8 = dbg.readRegister(hitThread, MuhDebugger::Register::X8);
 			printf("[helper_syscall] svc=0x%08x rcx=0x%llx rdx=0x%llx rbx=0x%llx rsp=0x%llx rbp=0x%llx rsi=0x%llx rdi=0x%llx r8=0x%llx\n",
-			       static_cast<uint32_t>(x0), x1, x2, x3, x4, x5, x6, x7, x8);
+			       static_cast<uint32_t>(x0 & 0xffffffffu), x1, x2, x3, x4, x5, x6, x7, x8);
 		} else {
 			const uint64_t x0 = dbg.readRegister(hitThread, MuhDebugger::Register::X0);
 			const uint64_t x1 = dbg.readRegister(hitThread, MuhDebugger::Register::X1);
