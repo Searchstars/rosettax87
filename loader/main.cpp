@@ -1,13 +1,16 @@
 #include <stdint.h>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <mach-o/dyld.h>
 #include <mach-o/dyld_images.h>
 #include <mach/mach_vm.h>
 
+#include <algorithm>
 #include <map>
+#include <vector>
 
-#include "macho_loader.hpp"
 #include "offset_finder.hpp"
 
 const char *logsEnabled = nullptr;
@@ -26,24 +29,49 @@ extern "C" void _dyld_process_info_for_each_image(DyldProcessInfo info, void (^c
 extern "C" void _dyld_process_info_release(DyldProcessInfo info);
 
 class MuhDebugger {
+public:
+	enum class WaitOutcome {
+		Stopped,
+		Exited,
+		Signaled,
+		Error
+	};
+
 private:
 	static const uint32_t AARCH64_BREAKPOINT; // just declare here
 
 	pid_t childPid_ = -1;
 	task_t taskPort_ = MACH_PORT_NULL;
 	std::map<uint64_t, uint32_t> breakpoints_; // addr -> original instruction
+	WaitOutcome lastWaitOutcome_ = WaitOutcome::Error;
+	int lastWaitStatus_ = 0;
+	int lastStopSignal_ = 0;
 
 	bool waitForStopped() {
 		int status;
 		if (waitpid(childPid_, &status, 0) == -1) {
 			perror("waitpid");
+			lastWaitOutcome_ = WaitOutcome::Error;
 			return false;
 		}
+		lastWaitStatus_ = status;
 		if (WIFSTOPPED(status)) {
 			int signal = WSTOPSIG(status);
 			LOG("Process stopped signal=%d\n", signal);
+			lastWaitOutcome_ = WaitOutcome::Stopped;
+			lastStopSignal_ = signal;
 			return true;
 		}
+		if (WIFEXITED(status)) {
+			lastWaitOutcome_ = WaitOutcome::Exited;
+			return false;
+		}
+		if (WIFSIGNALED(status)) {
+			lastWaitOutcome_ = WaitOutcome::Signaled;
+			return false;
+		}
+		lastWaitOutcome_ = WaitOutcome::Error;
+		lastStopSignal_ = 0;
 		return false;
 	}
 
@@ -84,13 +112,24 @@ public:
 		return true;
 	}
 
-	bool continueExecution() {
-		if (ptrace(PT_CONTINUE, childPid_, (caddr_t)1, 0) < 0) {
+	bool continueExecution(int signal = 0) {
+		if (ptrace(PT_CONTINUE, childPid_, (caddr_t)1, signal) < 0) {
 			perror("ptrace(PT_CONTINUE)");
 			return false;
 		}
 
 		LOG("continueExecution...\n");
+
+		return waitForStopped();
+	}
+
+	bool singleStep() {
+		if (ptrace(PT_STEP, childPid_, (caddr_t)1, 0) < 0) {
+			perror("ptrace(PT_STEP)");
+			return false;
+		}
+
+		LOG("singleStep...\n");
 
 		return waitForStopped();
 	}
@@ -102,6 +141,18 @@ public:
 		}
 		LOG("Debugger detached.\n");
 		return true;
+	}
+
+	WaitOutcome lastWaitOutcome() const {
+		return lastWaitOutcome_;
+	}
+
+	int lastWaitStatus() const {
+		return lastWaitStatus_;
+	}
+
+	int lastStopSignal() const {
+		return lastStopSignal_;
 	}
 
 	bool setBreakpoint(uint64_t address) {
@@ -170,77 +221,55 @@ public:
 		FP, LR, SP, PC, CPSR
 	};
 
-	uint64_t readRegister(Register reg) {
-		thread_act_port_array_t threadList;
-		mach_msg_type_number_t threadCount;
-
-		kern_return_t kr = task_threads(taskPort_, &threadList, &threadCount);
-		if (kr != KERN_SUCCESS) {
-			fprintf(stderr, "Failed to get threads (error 0x%x: %s)\n", kr, mach_error_string(kr));
-			return 0;
-		}
-
-		arm_thread_state64_t state;
+	bool getThreadState(thread_t thread, arm_thread_state64_t &state) {
 		mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
-		kr = thread_get_state(threadList[0], ARM_THREAD_STATE64, (thread_state_t)&state, &count);
-
+		kern_return_t kr = thread_get_state(thread, ARM_THREAD_STATE64, (thread_state_t)&state, &count);
 		if (kr != KERN_SUCCESS) {
 			fprintf(stderr, "Failed to get thread state (error 0x%x: %s)\n", kr, mach_error_string(kr));
-			return 0;
-		}
-
-		uint64_t value = 0;
-		if (reg >= X0 && reg <= X28) {
-			value = state.__x[reg];
-		} else {
-			switch (reg) {
-			case FP:
-				value = state.__fp;
-				break;
-			case LR:
-				value = state.__lr;
-				break;
-			case SP:
-				value = state.__sp;
-				break;
-			case PC:
-				value = state.__pc;
-				break;
-			case CPSR:
-				value = state.__cpsr;
-				break;
-			default: {
-				fprintf(stderr, "Invalid register\n");
-				return 0;
-			}
-			}
-		}
-
-		// Cleanup
-		for (unsigned int i = 0; i < threadCount; i++) {
-			mach_port_deallocate(mach_task_self(), threadList[i]);
-		}
-		vm_deallocate(mach_task_self(), (vm_address_t)threadList, sizeof(thread_t) * threadCount);
-
-		return value;
-	}
-
-	bool setRegister(Register reg, uint64_t value) {
-		thread_act_port_array_t threadList;
-		mach_msg_type_number_t threadCount;
-
-		kern_return_t kr = task_threads(taskPort_, &threadList, &threadCount);
-		if (kr != KERN_SUCCESS) {
-			fprintf(stderr, "Failed to get threads (error 0x%x: %s)\n", kr, mach_error_string(kr));
 			return false;
 		}
+		return true;
+	}
 
-		arm_thread_state64_t state;
-		mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
-		kr = thread_get_state(threadList[0], ARM_THREAD_STATE64, (thread_state_t)&state, &count);
-
+	bool setThreadState(thread_t thread, const arm_thread_state64_t &state) {
+		kern_return_t kr = thread_set_state(thread, ARM_THREAD_STATE64, (thread_state_t)&state, ARM_THREAD_STATE64_COUNT);
 		if (kr != KERN_SUCCESS) {
-			fprintf(stderr, "Failed to get thread state (error 0x%x: %s)\n", kr, mach_error_string(kr));
+			fprintf(stderr, "Failed to set thread state (error 0x%x: %s)\n", kr, mach_error_string(kr));
+			return false;
+		}
+		return true;
+	}
+
+	uint64_t readRegister(thread_t thread, Register reg) {
+		arm_thread_state64_t state;
+		if (!getThreadState(thread, state)) {
+			return 0;
+		}
+
+		if (reg >= X0 && reg <= X28) {
+			return state.__x[reg];
+		}
+
+		switch (reg) {
+		case FP:
+			return state.__fp;
+		case LR:
+			return state.__lr;
+		case SP:
+			return state.__sp;
+		case PC:
+			return state.__pc;
+		case CPSR:
+			return state.__cpsr;
+		default:
+			fprintf(stderr, "Invalid register\n");
+			return 0;
+		}
+	}
+
+	bool setRegister(thread_t thread, Register reg, uint64_t value) {
+		arm_thread_state64_t state;
+		if (!getThreadState(thread, state)) {
 			return false;
 		}
 
@@ -263,26 +292,128 @@ public:
 			case CPSR:
 				state.__cpsr = value;
 				break;
-			default: {
+			default:
 				fprintf(stderr, "Invalid register\n");
 				return false;
 			}
-			}
 		}
 
-		kr = thread_set_state(threadList[0], ARM_THREAD_STATE64, (thread_state_t)&state, ARM_THREAD_STATE64_COUNT);
+		return setThreadState(thread, state);
+	}
+
+	bool findThreadWithPc(const std::vector<uint64_t> &addresses, thread_t &threadOut, uint64_t &matchedAddrOut) {
+		thread_act_port_array_t threadList;
+		mach_msg_type_number_t threadCount;
+
+		kern_return_t kr = task_threads(taskPort_, &threadList, &threadCount);
 		if (kr != KERN_SUCCESS) {
-			fprintf(stderr, "Failed to set thread state (error 0x%x: %s)\n", kr, mach_error_string(kr));
+			fprintf(stderr, "Failed to get threads (error 0x%x: %s)\n", kr, mach_error_string(kr));
 			return false;
 		}
 
-		// Cleanup
-		for (uint i = 0; i < threadCount; i++) {
+		for (mach_msg_type_number_t i = 0; i < threadCount; i++) {
+			arm_thread_state64_t state;
+			if (!getThreadState(threadList[i], state)) {
+				mach_port_deallocate(mach_task_self(), threadList[i]);
+				continue;
+			}
+			const uint64_t pc = state.__pc;
+			for (const auto addr : addresses) {
+				if (pc == addr || pc == addr + 4) {
+					threadOut = threadList[i];
+					matchedAddrOut = addr;
+					for (mach_msg_type_number_t j = 0; j < threadCount; j++) {
+						if (j != i) {
+							mach_port_deallocate(mach_task_self(), threadList[j]);
+						}
+					}
+					vm_deallocate(mach_task_self(), (vm_address_t)threadList, sizeof(thread_t) * threadCount);
+					return true;
+				}
+			}
+			mach_port_deallocate(mach_task_self(), threadList[i]);
+		}
+
+		vm_deallocate(mach_task_self(), (vm_address_t)threadList, sizeof(thread_t) * threadCount);
+		return false;
+	}
+
+	bool findThreadAtAnyBreakpoint(thread_t &threadOut, uint64_t &matchedAddrOut) {
+		if (breakpoints_.empty()) {
+			return false;
+		}
+		std::vector<uint64_t> addresses;
+		addresses.reserve(breakpoints_.size());
+		for (const auto &entry : breakpoints_) {
+			addresses.push_back(entry.first);
+		}
+		return findThreadWithPc(addresses, threadOut, matchedAddrOut);
+	}
+
+	bool findThreadAtBrk(thread_t &threadOut, uint64_t &pcOut, uint32_t &instrOut) {
+		thread_act_port_array_t threadList;
+		mach_msg_type_number_t threadCount;
+
+		kern_return_t kr = task_threads(taskPort_, &threadList, &threadCount);
+		if (kr != KERN_SUCCESS) {
+			fprintf(stderr, "Failed to get threads (error 0x%x: %s)\n", kr, mach_error_string(kr));
+			return false;
+		}
+
+		for (mach_msg_type_number_t i = 0; i < threadCount; i++) {
+			arm_thread_state64_t state;
+			if (!getThreadState(threadList[i], state)) {
+				mach_port_deallocate(mach_task_self(), threadList[i]);
+				continue;
+			}
+
+			const uint64_t pc = state.__pc;
+			uint32_t instr = 0;
+			if (readMemory(pc, &instr, sizeof(instr)) && (instr & 0xFFE0001F) == AARCH64_BREAKPOINT) {
+				threadOut = threadList[i];
+				pcOut = pc;
+				instrOut = instr;
+				for (mach_msg_type_number_t j = 0; j < threadCount; j++) {
+					if (j != i) {
+						mach_port_deallocate(mach_task_self(), threadList[j]);
+					}
+				}
+				vm_deallocate(mach_task_self(), (vm_address_t)threadList, sizeof(thread_t) * threadCount);
+				return true;
+			}
+
+			mach_port_deallocate(mach_task_self(), threadList[i]);
+		}
+
+		vm_deallocate(mach_task_self(), (vm_address_t)threadList, sizeof(thread_t) * threadCount);
+		return false;
+	}
+
+	void logStopSignal(int signal, size_t maxThreads = 6) {
+		thread_act_port_array_t threadList;
+		mach_msg_type_number_t threadCount;
+
+		kern_return_t kr = task_threads(taskPort_, &threadList, &threadCount);
+		if (kr != KERN_SUCCESS) {
+			LOG("Failed to get threads for signal logging (error 0x%x: %s)\n", kr, mach_error_string(kr));
+			return;
+		}
+
+		const size_t limit = std::min(static_cast<size_t>(threadCount), maxThreads);
+		for (size_t i = 0; i < limit; i++) {
+			arm_thread_state64_t state;
+			if (!getThreadState(threadList[i], state)) {
+				continue;
+			}
+			uint32_t instr = 0;
+			(void)readMemory(state.__pc, &instr, sizeof(instr));
+			LOG("Signal %d thread[%zu] pc=0x%llx instr=0x%08x\n", signal, i, state.__pc, instr);
+		}
+
+		for (mach_msg_type_number_t i = 0; i < threadCount; i++) {
 			mach_port_deallocate(mach_task_self(), threadList[i]);
 		}
 		vm_deallocate(mach_task_self(), (vm_address_t)threadList, sizeof(thread_t) * threadCount);
-
-		return true;
 	}
 
 	bool adjustMemoryProtection(uint64_t address, vm_prot_t protection, mach_vm_size_t size) {
@@ -420,19 +551,6 @@ public:
 // Define the static constant outside the class
 const unsigned int MuhDebugger::AARCH64_BREAKPOINT = 0xD4200000;
 
-struct Exports {
-	uint64_t version; // 0x16A0000000000
-	uint64_t x87Exports;
-	uint64_t x87ExportCount;
-	uint64_t runtimeExports;
-	uint64_t runtimeExportCount;
-};
-
-struct Export {
-	uint64_t address;
-	uint64_t name;
-};
-
 int main(int argc, char *argv[]) {
 	if (argc < 2) {
 		fprintf(stderr, "%s <path to program>\n", argv[0]);
@@ -467,14 +585,14 @@ int main(int argc, char *argv[]) {
 
 	// Set up offsets dynamically
 	OffsetFinder offsetFinder;
-	// Set default offsets temporarily (or just in case we need to fall back)
 	offsetFinder.setDefaultOffsets();
-	// Search the rosetta runtime binary for offsets.
-	if (offsetFinder.determineOffsets()) {
-		LOG("Found rosetta runtime offsets successfully!\n");
-		LOG("offset_exports_fetch=%llx offset_svc_call_entry=%llx offset_svc_call_ret=%llx\n",
-		    offsetFinder.offsetExportsFetch_, offsetFinder.offsetSvcCallEntry_, offsetFinder.offsetSvcCallRet_);
+	if (!offsetFinder.determineOffsets()) {
+		fprintf(stderr, "Failed to locate helper patterns in Rosetta runtime.\n");
+		return 1;
 	}
+	LOG("Found rosetta runtime helper offsets successfully!\n");
+	LOG("offset_helper_syscall=%llx offset_helper_resolve_addr=%llx\n",
+	    offsetFinder.offsetHelperSyscall_, offsetFinder.offsetHelperResolveAddr_);
 
 	const auto runtimeBase = dbg.findRuntime();
 
@@ -485,136 +603,133 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
-	dbg.setBreakpoint(runtimeBase + offsetFinder.offsetExportsFetch_);
-	dbg.continueExecution();
-	dbg.removeBreakpoint(runtimeBase + offsetFinder.offsetExportsFetch_);
+	const auto helperSyscallAddr = runtimeBase + offsetFinder.offsetHelperSyscall_;
+	const auto helperResolveAddr = runtimeBase + offsetFinder.offsetHelperResolveAddr_;
 
-	auto rosettaRuntimeExportsAddress = dbg.readRegister(MuhDebugger::Register::X19);
-	LOG("Rosetta runtime exports: 0x%llx\n", rosettaRuntimeExportsAddress);
+	LOG("helper_syscall address: 0x%llx\n", helperSyscallAddr);
+	LOG("helper_resolve_addr address: 0x%llx\n", helperResolveAddr);
 
-	Exports exports;
-	dbg.readMemory(rosettaRuntimeExportsAddress, &exports, sizeof(exports));
-
-	LOG("Rosetta version: %llx\n", exports.version);
-
-	char path[PATH_MAX];
-	uint32_t pathSize = sizeof(path);
-	if (_NSGetExecutablePath(path, &pathSize) != 0) {
-		fprintf(stderr, "Failed to get executable path\n");
+	if (!dbg.setBreakpoint(helperSyscallAddr) || !dbg.setBreakpoint(helperResolveAddr)) {
+		fprintf(stderr, "Failed to set helper breakpoints\n");
 		return 1;
 	}
 
-	// get the directory of the current executable
-	std::filesystem::path executablePath(path);
-	std::filesystem::path executableDir = executablePath.parent_path();
+	int pendingSignal = 0;
+	size_t signalLogCount = 0;
+	size_t trapLogCount = 0;
+	while (true) {
+		if (!dbg.continueExecution(pendingSignal)) {
+			auto outcome = dbg.lastWaitOutcome();
+			if (outcome == MuhDebugger::WaitOutcome::Exited || outcome == MuhDebugger::WaitOutcome::Signaled) {
+				break;
+			}
+			fprintf(stderr, "Failed to continue execution\n");
+			break;
+		}
+		pendingSignal = 0;
 
-	MachoLoader machoLoader;
-	if (!machoLoader.open(executableDir / "libRuntimeRosettax87")) {
-		fprintf(stderr, "Failed to open Mach-O file\n");
-		return 1;
+		const int stopSignal = dbg.lastStopSignal();
+		if (stopSignal != SIGTRAP) {
+			if (logsEnabled && signalLogCount < 5) {
+				dbg.logStopSignal(stopSignal);
+				signalLogCount++;
+			}
+			if (stopSignal == SIGSYS) {
+				thread_t brkThread = MACH_PORT_NULL;
+				uint64_t brkPc = 0;
+				uint32_t brkInstr = 0;
+				if (dbg.findThreadAtBrk(brkThread, brkPc, brkInstr)) {
+					const uint32_t brkImm = (brkInstr >> 5) & 0xFFFF;
+					if (brkImm == 0x5) {
+						LOG("Redirecting SIGSYS BRK at 0x%llx to helper_syscall\n", brkPc);
+						dbg.setRegister(brkThread, MuhDebugger::Register::LR, brkPc + 4);
+						dbg.setRegister(brkThread, MuhDebugger::Register::PC, helperSyscallAddr);
+						mach_port_deallocate(mach_task_self(), brkThread);
+						continue;
+					}
+					mach_port_deallocate(mach_task_self(), brkThread);
+				}
+			}
+			pendingSignal = stopSignal;
+			continue;
+		}
+
+		thread_t hitThread = MACH_PORT_NULL;
+		uint64_t hitAddr = 0;
+		if (!dbg.findThreadAtAnyBreakpoint(hitThread, hitAddr)) {
+			if (logsEnabled && trapLogCount < 5) {
+				dbg.logStopSignal(SIGTRAP);
+				trapLogCount++;
+			}
+			thread_t brkThread = MACH_PORT_NULL;
+			uint64_t brkPc = 0;
+			uint32_t brkInstr = 0;
+			if (dbg.findThreadAtBrk(brkThread, brkPc, brkInstr)) {
+				const uint32_t brkImm = (brkInstr >> 5) & 0xFFFF;
+				if (brkImm == 0) {
+					LOG("Skipping SIGTRAP BRK #0 at 0x%llx\n", brkPc);
+					dbg.setRegister(brkThread, MuhDebugger::Register::PC, brkPc + 4);
+					mach_port_deallocate(mach_task_self(), brkThread);
+					continue;
+				}
+				mach_port_deallocate(mach_task_self(), brkThread);
+			}
+			pendingSignal = SIGTRAP;
+			continue;
+		}
+		const bool isSyscall = (hitAddr == helperSyscallAddr);
+
+		if (isSyscall) {
+			const uint64_t x0 = dbg.readRegister(hitThread, MuhDebugger::Register::X0);
+			const uint64_t x1 = dbg.readRegister(hitThread, MuhDebugger::Register::X1);
+			const uint64_t x2 = dbg.readRegister(hitThread, MuhDebugger::Register::X2);
+			const uint64_t x3 = dbg.readRegister(hitThread, MuhDebugger::Register::X3);
+			const uint64_t x4 = dbg.readRegister(hitThread, MuhDebugger::Register::X4);
+			const uint64_t x5 = dbg.readRegister(hitThread, MuhDebugger::Register::X5);
+			const uint64_t x6 = dbg.readRegister(hitThread, MuhDebugger::Register::X6);
+			const uint64_t x7 = dbg.readRegister(hitThread, MuhDebugger::Register::X7);
+			const uint64_t x8 = dbg.readRegister(hitThread, MuhDebugger::Register::X8);
+			printf("[helper_syscall] svc=0x%08x rcx=0x%llx rdx=0x%llx rbx=0x%llx rsp=0x%llx rbp=0x%llx rsi=0x%llx rdi=0x%llx r8=0x%llx\n",
+			       static_cast<uint32_t>(x0), x1, x2, x3, x4, x5, x6, x7, x8);
+		} else {
+			const uint64_t x0 = dbg.readRegister(hitThread, MuhDebugger::Register::X0);
+			const uint64_t x1 = dbg.readRegister(hitThread, MuhDebugger::Register::X1);
+			const uint64_t x2 = dbg.readRegister(hitThread, MuhDebugger::Register::X2);
+			printf("[helper_resolve_addr] context=0x%llx x86_address=0x%llx stubs_sh=0x%llx\n", x0, x1, x2);
+		}
+
+		if (!dbg.removeBreakpoint(hitAddr)) {
+			fprintf(stderr, "Failed to remove breakpoint at 0x%llx\n", hitAddr);
+			if (hitThread != MACH_PORT_NULL) {
+				mach_port_deallocate(mach_task_self(), hitThread);
+			}
+			return 1;
+		}
+
+		dbg.setRegister(hitThread, MuhDebugger::Register::PC, hitAddr);
+		if (!dbg.singleStep()) {
+			auto outcome = dbg.lastWaitOutcome();
+			if (outcome == MuhDebugger::WaitOutcome::Exited || outcome == MuhDebugger::WaitOutcome::Signaled) {
+				mach_port_deallocate(mach_task_self(), hitThread);
+				break;
+			}
+			fprintf(stderr, "Failed to single-step\n");
+			mach_port_deallocate(mach_task_self(), hitThread);
+			return 1;
+		}
+
+		if (!dbg.setBreakpoint(hitAddr)) {
+			fprintf(stderr, "Failed to reinsert breakpoint at 0x%llx\n", hitAddr);
+			mach_port_deallocate(mach_task_self(), hitThread);
+			return 1;
+		}
+
+		mach_port_deallocate(mach_task_self(), hitThread);
 	}
 
-	// first we store the original state of the thread
-	arm_thread_state64_t backupThreadState;
-	dbg.copyThreadState(backupThreadState);
-
-	// now we prepare the registers for the mmap call
-	arm_thread_state64_t mmapThreadState;
-	memcpy(&mmapThreadState, &backupThreadState, sizeof(arm_thread_state64_t));
-
-	mmapThreadState.__x[0] = 0LL;                                     // addr
-	mmapThreadState.__x[1] = machoLoader.imageSize();                 // size
-	mmapThreadState.__x[2] = VM_PROT_READ | VM_PROT_WRITE;            // prot
-	mmapThreadState.__x[3] = MAP_ANON | MAP_TRANSLATED_ALLOW_EXECUTE; // flags
-	mmapThreadState.__x[4] = -1;                                      // fd
-	mmapThreadState.__x[5] = 0;                                       // offset
-	mmapThreadState.__pc = runtimeBase + offsetFinder.offsetSvcCallEntry_;
-
-	dbg.restoreThreadState(mmapThreadState);
-
-	// setup a breakpoint after mmap syscall
-	dbg.setBreakpoint(runtimeBase + offsetFinder.offsetSvcCallRet_);
-	dbg.continueExecution();
-	dbg.removeBreakpoint(runtimeBase + offsetFinder.offsetSvcCallRet_);
-
-	uint64_t machoBase = dbg.readRegister(MuhDebugger::Register::X0);
-
-	LOG("Allocated memory at 0x%llx\n", machoBase);
-
-	dbg.restoreThreadState(backupThreadState);
-
-	machoLoader.forEachSegment([&](segment_command_64 *segm) {
-		auto dest = machoBase + segm->vmaddr;
-		auto size = segm->vmsize;
-		auto src = machoLoader.buffer_.data() + segm->fileoff;
-
-		LOG("Copying segment %s from 0x%llx to 0x%llx (%zx bytes)\n", segm->segname, segm->fileoff, dest, (size_t)size);
-
-		dbg.writeMemory(dest, src, size);
-
-		dbg.adjustMemoryProtection(dest, segm->initprot, segm->vmsize);
-	});
-
-	// fix up Exports segment of mapped macho
-	uint64_t machoExportsAddress = machoBase + machoLoader.getSection("__DATA", "exports")->addr;
-	Exports machoExports;
-
-	dbg.readMemory(machoExportsAddress, &machoExports, sizeof(machoExports));
-	machoExports.x87Exports += machoBase;
-	machoExports.runtimeExports += machoBase;
-
-	std::vector<Export> x87Exports(machoExports.x87ExportCount);
-	std::vector<Export> runtimeExports(machoExports.runtimeExportCount);
-
-	dbg.readMemory(machoExports.x87Exports, x87Exports.data(), x87Exports.size() * sizeof(Export));
-	dbg.readMemory(machoExports.runtimeExports, runtimeExports.data(), runtimeExports.size() * sizeof(Export));
-
-	for (auto &exp : x87Exports) {
-		exp.address += machoBase;
-		exp.name += machoBase;
+	if (dbg.lastWaitOutcome() == MuhDebugger::WaitOutcome::Stopped) {
+		dbg.detach();
 	}
-
-	for (auto &exp : runtimeExports) {
-		exp.address += machoBase;
-		exp.name += machoBase;
-	}
-
-	dbg.writeMemory(machoExports.x87Exports, x87Exports.data(), x87Exports.size() * sizeof(Export));
-	dbg.writeMemory(machoExports.runtimeExports, runtimeExports.data(), runtimeExports.size() * sizeof(Export));
-
-	LOG("machoExports_address: 0x%llx\n", machoExportsAddress);
-	LOG("machoExports.x87Exports: 0x%llx\n", machoExports.x87Exports);
-	LOG("machoExports.runtimeExports: 0x%llx\n", machoExports.runtimeExports);
-
-	dbg.writeMemory(machoExportsAddress, &machoExports, sizeof(machoExports));
-
-	// look up imports section of mapped macho
-	auto machoImportsAddress = machoBase + machoLoader.getSection("__DATA", "imports")->addr;
-	LOG("machoImportsAddress: 0x%llx\n", machoImportsAddress);
-
-	// read the exports from X19 register and copy them to the imports section of the mapped macho
-	auto libRosettaRuntimeExportsAddress = dbg.readRegister(MuhDebugger::Register::X19);
-	LOG("libRosettaRuntimeExportsAddress: 0x%llx\n", libRosettaRuntimeExportsAddress);
-
-	Exports libRosettaRuntimeExports;
-	dbg.readMemory(libRosettaRuntimeExportsAddress, &libRosettaRuntimeExports, sizeof(libRosettaRuntimeExports));
-
-	LOG("libRosettaRuntimeExports.version = 0x%llx\n", libRosettaRuntimeExports.version);
-	LOG("libRosettaRuntimeExports.x87Exports = 0x%llx\n", libRosettaRuntimeExports.x87Exports);
-	LOG("libRosettaRuntimeExports.x87Export_count = 0x%llx\n", libRosettaRuntimeExports.x87ExportCount);
-	LOG("libRosettaRuntimeExports.runtimeExports = 0x%llx\n", libRosettaRuntimeExports.runtimeExports);
-	LOG("libRosettaRuntimeExports.runtimeExportCount = 0x%llx\n", libRosettaRuntimeExports.runtimeExportCount);
-
-	dbg.writeMemory(machoImportsAddress, &libRosettaRuntimeExports, sizeof(libRosettaRuntimeExports));
-
-	// replace the exports in X19 register with the address of the mapped macho
-	dbg.setRegister(MuhDebugger::Register::X19, machoExportsAddress);
-
-	dbg.detach();
-
-	// block until the child exits
-	int status;
-	waitpid(child, &status, 0);
 
 	return 0;
 }
