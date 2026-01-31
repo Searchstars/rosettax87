@@ -1,4 +1,12 @@
 #include <stdint.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+#include <thread>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
@@ -9,11 +17,93 @@
 
 #include <algorithm>
 #include <map>
+#include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "offset_finder.hpp"
 
 const char *logsEnabled = nullptr;
+static bool hookLogsEnabled = true;
+static bool hookLogInitialized = false;
+static int hookLogFd = -1;
+static int hookLogSinkFd = STDERR_FILENO;
+
+static void initHookLog() {
+	if (hookLogInitialized) {
+		return;
+	}
+	hookLogInitialized = true;
+
+	const char *env = getenv("ROSETTA_HOOK_LOGS");
+	if (env && strcmp(env, "0") == 0) {
+		hookLogsEnabled = false;
+		return;
+	}
+
+	const char *logPath = getenv("ROSETTA_HOOK_LOG_PATH");
+	if (logPath && *logPath) {
+		const int fd = open(logPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+		if (fd >= 0) {
+			hookLogSinkFd = fd;
+		}
+	}
+
+	int pipeFds[2];
+	if (pipe(pipeFds) == 0) {
+		hookLogFd = pipeFds[1];
+		const int readFd = pipeFds[0];
+		const int flags = fcntl(hookLogFd, F_GETFL, 0);
+		if (flags != -1) {
+			(void)fcntl(hookLogFd, F_SETFL, flags | O_NONBLOCK);
+		}
+		std::thread([readFd]() {
+			char buffer[4096];
+			while (true) {
+				const ssize_t bytes = read(readFd, buffer, sizeof(buffer));
+				if (bytes <= 0) {
+					break;
+				}
+				ssize_t offset = 0;
+				while (offset < bytes) {
+					const ssize_t written = write(hookLogSinkFd, buffer + offset, static_cast<size_t>(bytes - offset));
+					if (written < 0) {
+						if (errno == EINTR) {
+							continue;
+						}
+						break;
+					}
+					offset += written;
+				}
+			}
+			close(readFd);
+		}).detach();
+	} else {
+		hookLogFd = hookLogSinkFd;
+	}
+}
+
+static void hookLog(const char *fmt, ...) {
+	initHookLog();
+	if (!hookLogsEnabled) {
+		return;
+	}
+
+	char buffer[512];
+	va_list args;
+	va_start(args, fmt);
+	const int len = vsnprintf(buffer, sizeof(buffer), fmt, args);
+	va_end(args);
+	if (len <= 0) {
+		return;
+	}
+
+	const size_t toWrite = static_cast<size_t>(len < static_cast<int>(sizeof(buffer)) ? len : static_cast<int>(sizeof(buffer)));
+	const ssize_t written = write(hookLogFd, buffer, toWrite);
+	if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+		return;
+	}
+}
 
 #define LOG(fmt, ...)                   \
     do {                                \
@@ -43,6 +133,8 @@ private:
 	pid_t childPid_ = -1;
 	task_t taskPort_ = MACH_PORT_NULL;
 	std::map<uint64_t, uint32_t> breakpoints_; // addr -> original instruction
+	std::map<uint64_t, uint32_t> tempBreakpoints_; // addr -> original instruction
+	std::map<uint64_t, uint64_t> tempOrigins_; // temp addr -> breakpoint addr
 	WaitOutcome lastWaitOutcome_ = WaitOutcome::Error;
 	int lastWaitStatus_ = 0;
 	int lastStopSignal_ = 0;
@@ -189,6 +281,36 @@ public:
 		return true;
 	}
 
+	bool setTempBreakpoint(uint64_t address, uint64_t originAddress) {
+		if (tempBreakpoints_.find(address) != tempBreakpoints_.end()) {
+			return true;
+		}
+
+		uint32_t original;
+		if (!readMemory(address, &original, sizeof(uint32_t))) {
+			fprintf(stderr, "Failed to read memory at 0x%llx\n", address);
+			return false;
+		}
+
+		if (!adjustMemoryProtection(address, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, sizeof(uint32_t))) {
+			return false;
+		}
+
+		if (!writeMemory(address, &AARCH64_BREAKPOINT, sizeof(uint32_t))) {
+			fprintf(stderr, "Failed to write temp breakpoint at 0x%llx\n", address);
+			return false;
+		}
+
+		if (!adjustMemoryProtection(address, VM_PROT_READ | VM_PROT_EXECUTE, sizeof(uint32_t))) {
+			return false;
+		}
+
+		tempBreakpoints_[address] = original;
+		tempOrigins_[address] = originAddress;
+		LOG("Temp breakpoint set at address 0x%llx (origin 0x%llx)\n", address, originAddress);
+		return true;
+	}
+
 	bool removeBreakpoint(uint64_t address) {
 		auto it = breakpoints_.find(address);
 		if (it == breakpoints_.end()) {
@@ -213,6 +335,44 @@ public:
 		breakpoints_.erase(it);
 		LOG("Breakpoint removed from address 0x%llx\n", address);
 		return true;
+	}
+
+	bool removeTempBreakpoint(uint64_t address) {
+		auto it = tempBreakpoints_.find(address);
+		if (it == tempBreakpoints_.end()) {
+			fprintf(stderr, "No temp breakpoint found at address 0x%llx\n", address);
+			return false;
+		}
+
+		if (!adjustMemoryProtection(address, VM_PROT_READ | VM_PROT_WRITE, sizeof(uint32_t))) {
+			return false;
+		}
+
+		if (!writeMemory(address, &it->second, sizeof(uint32_t))) {
+			fprintf(stderr, "Failed to restore temp original instruction at 0x%llx\n", address);
+			return false;
+		}
+
+		if (!adjustMemoryProtection(address, VM_PROT_READ | VM_PROT_EXECUTE, sizeof(uint32_t))) {
+			return false;
+		}
+
+		tempBreakpoints_.erase(it);
+		tempOrigins_.erase(address);
+		LOG("Temp breakpoint removed from address 0x%llx\n", address);
+		return true;
+	}
+
+	bool isTempBreakpoint(uint64_t address) const {
+		return tempBreakpoints_.find(address) != tempBreakpoints_.end();
+	}
+
+	uint64_t tempOrigin(uint64_t address) const {
+		auto it = tempOrigins_.find(address);
+		if (it == tempOrigins_.end()) {
+			return 0;
+		}
+		return it->second;
 	}
 
 	enum Register {
@@ -319,7 +479,7 @@ public:
 			}
 			const uint64_t pc = state.__pc;
 			for (const auto addr : addresses) {
-				if (pc == addr || pc == addr + 4) {
+				if (pc == addr) {
 					threadOut = threadList[i];
 					matchedAddrOut = addr;
 					for (mach_msg_type_number_t j = 0; j < threadCount; j++) {
@@ -339,12 +499,15 @@ public:
 	}
 
 	bool findThreadAtAnyBreakpoint(thread_t &threadOut, uint64_t &matchedAddrOut) {
-		if (breakpoints_.empty()) {
+		if (breakpoints_.empty() && tempBreakpoints_.empty()) {
 			return false;
 		}
 		std::vector<uint64_t> addresses;
-		addresses.reserve(breakpoints_.size());
+		addresses.reserve(breakpoints_.size() + tempBreakpoints_.size());
 		for (const auto &entry : breakpoints_) {
+			addresses.push_back(entry.first);
+		}
+		for (const auto &entry : tempBreakpoints_) {
 			addresses.push_back(entry.first);
 		}
 		return findThreadWithPc(addresses, threadOut, matchedAddrOut);
@@ -387,6 +550,41 @@ public:
 
 		vm_deallocate(mach_task_self(), (vm_address_t)threadList, sizeof(thread_t) * threadCount);
 		return false;
+	}
+
+	bool suspendOtherThreads(thread_t keepThread, std::vector<thread_t> &suspended) {
+		thread_act_port_array_t threadList;
+		mach_msg_type_number_t threadCount;
+
+		kern_return_t kr = task_threads(taskPort_, &threadList, &threadCount);
+		if (kr != KERN_SUCCESS) {
+			fprintf(stderr, "Failed to get threads for suspension (error 0x%x: %s)\n", kr, mach_error_string(kr));
+			return false;
+		}
+
+		for (mach_msg_type_number_t i = 0; i < threadCount; i++) {
+			if (threadList[i] == keepThread) {
+				mach_port_deallocate(mach_task_self(), threadList[i]);
+				continue;
+			}
+			kr = thread_suspend(threadList[i]);
+			if (kr == KERN_SUCCESS) {
+				suspended.push_back(threadList[i]);
+			} else {
+				mach_port_deallocate(mach_task_self(), threadList[i]);
+			}
+		}
+
+		vm_deallocate(mach_task_self(), (vm_address_t)threadList, sizeof(thread_t) * threadCount);
+		return true;
+	}
+
+	void resumeThreads(std::vector<thread_t> &suspended) {
+		for (auto thread : suspended) {
+			(void)thread_resume(thread);
+			mach_port_deallocate(mach_task_self(), thread);
+		}
+		suspended.clear();
 	}
 
 	void logStopSignal(int signal, size_t maxThreads = 6) {
@@ -558,6 +756,30 @@ int main(int argc, char *argv[]) {
 	}
 
 	logsEnabled = getenv("ROSETTA_X87_LOGS");
+	const bool resolveLogAll = getenv("ROSETTA_RESOLVE_LOG_ALL") != nullptr;
+	std::unordered_set<uint64_t> resolveSeen;
+	const std::string targetPath = argc > 1 ? argv[1] : "";
+	const bool passSigtrapBrk = getenv("ROSETTA_PASS_SIGTRAP") != nullptr;
+	const bool redirectSigsysBrk = getenv("ROSETTA_SKIP_SIGSYS_REDIRECT") == nullptr;
+	const bool skipWinebootHook = getenv("ROSETTA_SKIP_WINEBOOT") != nullptr;
+	size_t resolveHookLimit = 100;
+	if (const char *limitEnv = getenv("ROSETTA_RESOLVE_HOOK_LIMIT")) {
+		resolveHookLimit = strtoull(limitEnv, nullptr, 10);
+	}
+	bool resolveHookEnabled = resolveHookLimit != 0;
+	size_t resolveHookCount = 0;
+	bool isWineboot = false;
+	for (int i = 1; i < argc; i++) {
+		if (strstr(argv[i], "wineboot.exe") != nullptr) {
+			isWineboot = true;
+			break;
+		}
+	}
+	if (isWineboot && skipWinebootHook) {
+		execv(argv[1], &argv[1]);
+		perror("execv");
+		return 1;
+	}
 
 	LOG("Launching debugger.\n");
 
@@ -588,7 +810,8 @@ int main(int argc, char *argv[]) {
 	offsetFinder.setDefaultOffsets();
 	if (!offsetFinder.determineOffsets()) {
 		fprintf(stderr, "Failed to locate helper patterns in Rosetta runtime.\n");
-		return 1;
+		dbg.detach();
+		return 0;
 	}
 	LOG("Found rosetta runtime helper offsets successfully!\n");
 	LOG("offset_helper_syscall=%llx offset_helper_resolve_addr=%llx\n",
@@ -599,8 +822,9 @@ int main(int argc, char *argv[]) {
 	LOG("Rosetta runtime base: 0x%lx\n", runtimeBase);
 
 	if (runtimeBase == 0) {
-		fprintf(stderr, "Failed to find Rosetta runtime\n");
-		return 1;
+		fprintf(stderr, "Rosetta runtime not found; running without hooks.\n");
+		dbg.detach();
+		return 0;
 	}
 
 	const auto helperSyscallAddr = runtimeBase + offsetFinder.offsetHelperSyscall_;
@@ -609,8 +833,10 @@ int main(int argc, char *argv[]) {
 	LOG("helper_syscall address: 0x%llx\n", helperSyscallAddr);
 	LOG("helper_resolve_addr address: 0x%llx\n", helperResolveAddr);
 
-	if (!dbg.setBreakpoint(helperSyscallAddr) || !dbg.setBreakpoint(helperResolveAddr)) {
+	if (!dbg.setBreakpoint(helperSyscallAddr) ||
+	    (resolveHookEnabled && !dbg.setBreakpoint(helperResolveAddr))) {
 		fprintf(stderr, "Failed to set helper breakpoints\n");
+		dbg.detach();
 		return 1;
 	}
 
@@ -635,6 +861,10 @@ int main(int argc, char *argv[]) {
 				signalLogCount++;
 			}
 			if (stopSignal == SIGSYS) {
+				if (!redirectSigsysBrk) {
+					pendingSignal = stopSignal;
+					continue;
+				}
 				thread_t brkThread = MACH_PORT_NULL;
 				uint64_t brkPc = 0;
 				uint32_t brkInstr = 0;
@@ -647,7 +877,6 @@ int main(int argc, char *argv[]) {
 						mach_port_deallocate(mach_task_self(), brkThread);
 						continue;
 					}
-					mach_port_deallocate(mach_task_self(), brkThread);
 				}
 			}
 			pendingSignal = stopSignal;
@@ -666,18 +895,49 @@ int main(int argc, char *argv[]) {
 			uint32_t brkInstr = 0;
 			if (dbg.findThreadAtBrk(brkThread, brkPc, brkInstr)) {
 				const uint32_t brkImm = (brkInstr >> 5) & 0xFFFF;
-				if (brkImm == 0) {
-					LOG("Skipping SIGTRAP BRK #0 at 0x%llx\n", brkPc);
-					dbg.setRegister(brkThread, MuhDebugger::Register::PC, brkPc + 4);
+				if (passSigtrapBrk) {
+					LOG("Passing SIGTRAP BRK #%u at 0x%llx\n", brkImm, brkPc);
 					mach_port_deallocate(mach_task_self(), brkThread);
+					pendingSignal = SIGTRAP;
 					continue;
 				}
+				LOG("Skipping SIGTRAP BRK #%u at 0x%llx\n", brkImm, brkPc);
+				dbg.setRegister(brkThread, MuhDebugger::Register::PC, brkPc + 4);
 				mach_port_deallocate(mach_task_self(), brkThread);
+				continue;
 			}
-			pendingSignal = SIGTRAP;
+			LOG("Ignoring SIGTRAP at non-BRK instruction\n");
 			continue;
 		}
+
+		if (dbg.isTempBreakpoint(hitAddr)) {
+			const uint64_t originAddr = dbg.tempOrigin(hitAddr);
+			const bool restoreOrigin = !(originAddr == helperResolveAddr && !resolveHookEnabled);
+			if (!dbg.removeTempBreakpoint(hitAddr)) {
+				fprintf(stderr, "Failed to remove temp breakpoint at 0x%llx\n", hitAddr);
+				if (hitThread != MACH_PORT_NULL) {
+					mach_port_deallocate(mach_task_self(), hitThread);
+				}
+				return 1;
+			}
+			if (restoreOrigin && originAddr != 0 && !dbg.setBreakpoint(originAddr)) {
+				fprintf(stderr, "Failed to restore breakpoint at 0x%llx\n", originAddr);
+				mach_port_deallocate(mach_task_self(), hitThread);
+				return 1;
+			}
+			mach_port_deallocate(mach_task_self(), hitThread);
+			continue;
+		}
+
 		const bool isSyscall = (hitAddr == helperSyscallAddr);
+		const bool isResolve = (hitAddr == helperResolveAddr);
+		if (isResolve && resolveHookEnabled && resolveHookLimit > 0) {
+			resolveHookCount++;
+			if (resolveHookCount > resolveHookLimit) {
+				resolveHookEnabled = false;
+				LOG("Disabling helper_resolve_addr hook after %zu hits\n", resolveHookCount);
+			}
+		}
 
 		if (isSyscall) {
 			const uint64_t x0 = dbg.readRegister(hitThread, MuhDebugger::Register::X0);
@@ -689,13 +949,23 @@ int main(int argc, char *argv[]) {
 			const uint64_t x6 = dbg.readRegister(hitThread, MuhDebugger::Register::X6);
 			const uint64_t x7 = dbg.readRegister(hitThread, MuhDebugger::Register::X7);
 			const uint64_t x8 = dbg.readRegister(hitThread, MuhDebugger::Register::X8);
-			printf("[helper_syscall] svc=0x%08x rcx=0x%llx rdx=0x%llx rbx=0x%llx rsp=0x%llx rbp=0x%llx rsi=0x%llx rdi=0x%llx r8=0x%llx\n",
-			       static_cast<uint32_t>(x0 & 0xffffffffu), x1, x2, x3, x4, x5, x6, x7, x8);
+			hookLog("[helper_syscall] svc=0x%08x rcx=0x%llx rdx=0x%llx rbx=0x%llx rsp=0x%llx rbp=0x%llx rsi=0x%llx rdi=0x%llx r8=0x%llx\n",
+			        static_cast<uint32_t>(x0 & 0xffffffffu), x1, x2, x3, x4, x5, x6, x7, x8);
 		} else {
 			const uint64_t x0 = dbg.readRegister(hitThread, MuhDebugger::Register::X0);
 			const uint64_t x1 = dbg.readRegister(hitThread, MuhDebugger::Register::X1);
 			const uint64_t x2 = dbg.readRegister(hitThread, MuhDebugger::Register::X2);
-			printf("[helper_resolve_addr] context=0x%llx x86_address=0x%llx stubs_sh=0x%llx\n", x0, x1, x2);
+			bool shouldLog = resolveLogAll;
+			if (!shouldLog) {
+				auto inserted = resolveSeen.insert(x1).second;
+				shouldLog = inserted;
+				if (resolveSeen.size() > 100000) {
+					resolveSeen.clear();
+				}
+			}
+			if (shouldLog) {
+				hookLog("[helper_resolve_addr] context=0x%llx x86_address=0x%llx stubs_sh=0x%llx\n", x0, x1, x2);
+			}
 		}
 
 		if (!dbg.removeBreakpoint(hitAddr)) {
@@ -706,22 +976,13 @@ int main(int argc, char *argv[]) {
 			return 1;
 		}
 
-		dbg.setRegister(hitThread, MuhDebugger::Register::PC, hitAddr);
-		if (!dbg.singleStep()) {
-			auto outcome = dbg.lastWaitOutcome();
-			if (outcome == MuhDebugger::WaitOutcome::Exited || outcome == MuhDebugger::WaitOutcome::Signaled) {
+		if (!(isResolve && !resolveHookEnabled)) {
+			const uint64_t tempAddr = hitAddr + 4;
+			if (!dbg.setTempBreakpoint(tempAddr, hitAddr)) {
+				fprintf(stderr, "Failed to set temp breakpoint at 0x%llx\n", tempAddr);
 				mach_port_deallocate(mach_task_self(), hitThread);
-				break;
+				return 1;
 			}
-			fprintf(stderr, "Failed to single-step\n");
-			mach_port_deallocate(mach_task_self(), hitThread);
-			return 1;
-		}
-
-		if (!dbg.setBreakpoint(hitAddr)) {
-			fprintf(stderr, "Failed to reinsert breakpoint at 0x%llx\n", hitAddr);
-			mach_port_deallocate(mach_task_self(), hitThread);
-			return 1;
 		}
 
 		mach_port_deallocate(mach_task_self(), hitThread);
