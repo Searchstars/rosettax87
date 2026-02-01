@@ -74,12 +74,12 @@ auto OffsetFinder::determineOffsets() -> bool {
 	const auto helperSyscallOffset = findPattern(buffer, helperSyscallPattern);
 	const auto helperResolveOffset = findPattern(buffer, helperResolvePattern);
 
-	if (!helperSyscallOffset || !helperResolveOffset) {
-		fprintf(stderr, "Helper patterns not found in rosetta runtime binary.\n");
+	if (!helperSyscallOffset) {
+		fprintf(stderr, "helper_syscall pattern not found in rosetta runtime binary.\n");
 		return false;
 	}
 
 	offsetHelperSyscall_ = *helperSyscallOffset;
-	offsetHelperResolveAddr_ = *helperResolveOffset;
+	offsetHelperResolveAddr_ = helperResolveOffset ? *helperResolveOffset : 0;
 	return true;
 }

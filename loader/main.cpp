@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <errno.h>
+#include <fstream>
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
@@ -13,11 +14,14 @@
 #include <signal.h>
 #include <mach-o/dyld.h>
 #include <mach-o/dyld_images.h>
+#include <mach-o/loader.h>
 #include <mach/mach_vm.h>
-
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -35,13 +39,13 @@ static void initHookLog() {
 	}
 	hookLogInitialized = true;
 
-	const char *env = getenv("ROSETTA_HOOK_LOGS");
+	const char *env = getenv("ASTROWINE_HOOK_LOGS");
 	if (env && strcmp(env, "0") == 0) {
 		hookLogsEnabled = false;
 		return;
 	}
 
-	const char *logPath = getenv("ROSETTA_HOOK_LOG_PATH");
+	const char *logPath = getenv("ASTROWINE_HOOK_LOG_PATH");
 	if (logPath && *logPath) {
 		const int fd = open(logPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
 		if (fd >= 0) {
@@ -105,6 +109,280 @@ static void hookLog(const char *fmt, ...) {
 	}
 }
 
+static std::optional<uint64_t> findPatternInFile(const char *path, const std::vector<uint8_t> &pattern) {
+	if (!path || pattern.empty()) {
+		return std::nullopt;
+	}
+	std::ifstream file(path, std::ios::binary);
+	if (!file) {
+		return std::nullopt;
+	}
+	file.seekg(0, std::ios::end);
+	const std::streampos size = file.tellg();
+	file.seekg(0, std::ios::beg);
+	if (size <= 0) {
+		return std::nullopt;
+	}
+	std::vector<unsigned char> buffer(static_cast<size_t>(size));
+	if (!file.read(reinterpret_cast<char *>(buffer.data()), size)) {
+		return std::nullopt;
+	}
+	const size_t patSize = pattern.size();
+	if (buffer.size() < patSize) {
+		return std::nullopt;
+	}
+	for (size_t i = 0; i + patSize <= buffer.size(); ++i) {
+		bool match = true;
+		for (size_t j = 0; j < patSize; ++j) {
+			if (buffer[i + j] != pattern[j]) {
+				match = false;
+				break;
+			}
+		}
+		if (match) {
+			return static_cast<uint64_t>(i);
+		}
+	}
+	return std::nullopt;
+}
+
+struct MachSegmentInfo {
+	std::string name;
+	uint64_t vmaddr = 0;
+	uint64_t vmsize = 0;
+	uint64_t fileoff = 0;
+	uint64_t filesize = 0;
+	vm_prot_t initprot = 0;
+};
+
+struct MachSectionInfo {
+	std::string segname;
+	std::string sectname;
+	uint64_t addr = 0;
+	uint64_t size = 0;
+	uint64_t offset = 0;
+};
+
+static bool loadFileBuffer(const char *path, std::vector<unsigned char> &buffer) {
+	if (!path) {
+		return false;
+	}
+	std::ifstream file(path, std::ios::binary);
+	if (!file) {
+		return false;
+	}
+	file.seekg(0, std::ios::end);
+	const std::streampos size = file.tellg();
+	file.seekg(0, std::ios::beg);
+	if (size <= 0) {
+		return false;
+	}
+	buffer.resize(static_cast<size_t>(size));
+	return static_cast<bool>(file.read(reinterpret_cast<char *>(buffer.data()), size));
+}
+
+static std::string extractMachName(const char *raw, size_t maxLen) {
+	const size_t len = strnlen(raw, maxLen);
+	return std::string(raw, raw + len);
+}
+
+static bool parseMachO(const std::vector<unsigned char> &buffer,
+                       std::vector<MachSegmentInfo> &segments,
+                       std::vector<MachSectionInfo> &sections) {
+	if (buffer.size() < sizeof(mach_header_64)) {
+		return false;
+	}
+	const auto *header = reinterpret_cast<const mach_header_64 *>(buffer.data());
+	if (header->magic != MH_MAGIC_64) {
+		return false;
+	}
+	uint64_t offset = sizeof(mach_header_64);
+	for (uint32_t i = 0; i < header->ncmds; ++i) {
+		if (offset + sizeof(load_command) > buffer.size()) {
+			return false;
+		}
+		const auto *cmd = reinterpret_cast<const load_command *>(buffer.data() + offset);
+		if (cmd->cmd == LC_SEGMENT_64) {
+			if (offset + sizeof(segment_command_64) > buffer.size()) {
+				return false;
+			}
+			const auto *seg = reinterpret_cast<const segment_command_64 *>(buffer.data() + offset);
+			MachSegmentInfo segInfo;
+			segInfo.name = extractMachName(seg->segname, sizeof(seg->segname));
+			segInfo.vmaddr = seg->vmaddr;
+			segInfo.vmsize = seg->vmsize;
+			segInfo.fileoff = seg->fileoff;
+			segInfo.filesize = seg->filesize;
+			segInfo.initprot = seg->initprot;
+			segments.push_back(segInfo);
+
+			const uint64_t sectionsOffset = offset + sizeof(segment_command_64);
+			const uint64_t needed = sectionsOffset + static_cast<uint64_t>(seg->nsects) * sizeof(section_64);
+			if (needed > buffer.size()) {
+				return false;
+			}
+			const auto *sec = reinterpret_cast<const section_64 *>(buffer.data() + sectionsOffset);
+			for (uint32_t s = 0; s < seg->nsects; ++s) {
+				MachSectionInfo secInfo;
+				secInfo.segname = extractMachName(sec[s].segname, sizeof(sec[s].segname));
+				secInfo.sectname = extractMachName(sec[s].sectname, sizeof(sec[s].sectname));
+				secInfo.addr = sec[s].addr;
+				secInfo.size = sec[s].size;
+				secInfo.offset = sec[s].offset;
+				sections.push_back(secInfo);
+			}
+		}
+		offset += cmd->cmdsize;
+		if (offset > buffer.size()) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static std::optional<uint64_t> findSegmentVmaddr(const std::vector<MachSegmentInfo> &segments, const char *name) {
+	if (!name) {
+		return std::nullopt;
+	}
+	for (const auto &seg : segments) {
+		if (seg.name == name) {
+			return seg.vmaddr;
+		}
+	}
+	return std::nullopt;
+}
+
+static std::optional<uint64_t> fileOffsetToVmAddr(const std::vector<MachSegmentInfo> &segments, uint64_t fileOffset) {
+	for (const auto &seg : segments) {
+		if (fileOffset >= seg.fileoff && fileOffset < seg.fileoff + seg.filesize) {
+			return seg.vmaddr + (fileOffset - seg.fileoff);
+		}
+	}
+	return std::nullopt;
+}
+
+static bool rangeOverlaps(uint64_t start, uint64_t size, const std::vector<std::pair<uint64_t, uint64_t>> &ranges) {
+	const uint64_t end = start + size;
+	for (const auto &range : ranges) {
+		if (start < range.second && end > range.first) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static std::optional<uint64_t> findZeroCave(const std::vector<unsigned char> &buffer,
+                                            const std::vector<MachSegmentInfo> &segments,
+                                            const std::vector<MachSectionInfo> &sections,
+                                            size_t minSize,
+                                            size_t alignment,
+                                            vm_prot_t requiredProt,
+                                            bool avoidSections) {
+	const size_t aligned = alignment ? alignment : 1;
+	for (const auto &seg : segments) {
+		if ((seg.initprot & requiredProt) != requiredProt) {
+			continue;
+		}
+		if (seg.filesize == 0) {
+			continue;
+		}
+		const uint64_t segStart = seg.fileoff;
+		const uint64_t segEnd = seg.fileoff + seg.filesize;
+		if (segEnd > buffer.size()) {
+			continue;
+		}
+		std::vector<std::pair<uint64_t, uint64_t>> usedRanges;
+		if (avoidSections) {
+			for (const auto &sec : sections) {
+				if (sec.segname != seg.name) {
+					continue;
+				}
+				if (sec.offset == 0 || sec.size == 0) {
+					continue;
+				}
+				usedRanges.emplace_back(sec.offset, sec.offset + sec.size);
+			}
+		}
+		uint64_t i = segStart;
+		while (i < segEnd) {
+			if (buffer[i] != 0) {
+				++i;
+				continue;
+			}
+			uint64_t j = i + 1;
+			while (j < segEnd && buffer[j] == 0) {
+				++j;
+			}
+			uint64_t runStart = i;
+			uint64_t runEnd = j;
+			uint64_t alignedStart = (runStart + (aligned - 1)) & ~(aligned - 1);
+			if (alignedStart + minSize <= runEnd) {
+				if (!avoidSections || !rangeOverlaps(alignedStart, minSize, usedRanges)) {
+					return alignedStart;
+				}
+			}
+			i = j;
+		}
+	}
+	return std::nullopt;
+}
+
+static std::optional<uint32_t> encodeBranch(uint64_t from, uint64_t to) {
+	const int64_t diff = static_cast<int64_t>(to) - static_cast<int64_t>(from);
+	if (diff % 4 != 0) {
+		return std::nullopt;
+	}
+	const int64_t imm = diff >> 2;
+	if (imm < -(1LL << 25) || imm >= (1LL << 25)) {
+		return std::nullopt;
+	}
+	const uint32_t encoded = 0x14000000u | (static_cast<uint32_t>(imm) & 0x03ffffffu);
+	return encoded;
+}
+
+constexpr size_t kHelperInlineStubSize = 0x48;
+constexpr size_t kHelperInlineOrigOffset = 0x34;
+constexpr size_t kHelperInlineBranchOffset = 0x38;
+constexpr size_t kHelperInlineLiteralOffset = 0x40;
+constexpr size_t kHelperInlineEntrySize = 0x80;
+constexpr size_t kHelperInlineBufferSize = 0x2000;
+constexpr size_t kHelperInlineBufferMask = kHelperInlineBufferSize - 1;
+constexpr size_t kHelperInlineHeaderSize = 0x10;
+
+struct HelperInlineEntry {
+	uint64_t regs[16];
+};
+
+static_assert(sizeof(HelperInlineEntry) == kHelperInlineEntrySize, "Helper inline entry size mismatch");
+
+static bool buildHelperInlineStub(uint32_t originalInstr,
+                                  uint64_t stubAddr,
+                                  uint64_t returnAddr,
+                                  uint64_t bufferAddr,
+                                  std::vector<uint8_t> &outStub) {
+	const uint8_t templateBytes[kHelperInlineStubSize] = {
+		0x10, 0x02, 0x00, 0x58, 0x11, 0x02, 0x40, 0xF9,
+		0x0F, 0x42, 0x00, 0x91, 0xEF, 0x01, 0x11, 0x8B,
+		0xE0, 0x05, 0x00, 0xA9, 0xE2, 0x0D, 0x01, 0xA9,
+		0xE4, 0x15, 0x02, 0xA9, 0xE6, 0x1D, 0x03, 0xA9,
+		0xE8, 0x21, 0x00, 0xF9, 0xFF, 0x25, 0x00, 0xF9,
+		0x31, 0x02, 0x02, 0x91, 0x31, 0x32, 0x40, 0x92,
+		0x11, 0x02, 0x00, 0xF9, 0xAA, 0xAA, 0xAA, 0xAA,
+		0x00, 0x00, 0x00, 0x14, 0x1F, 0x20, 0x03, 0xD5,
+		0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB
+	};
+	outStub.assign(templateBytes, templateBytes + kHelperInlineStubSize);
+
+	memcpy(outStub.data() + kHelperInlineOrigOffset, &originalInstr, sizeof(originalInstr));
+	auto branch = encodeBranch(stubAddr + kHelperInlineBranchOffset, returnAddr);
+	if (!branch) {
+		return false;
+	}
+	memcpy(outStub.data() + kHelperInlineBranchOffset, &(*branch), sizeof(*branch));
+	memcpy(outStub.data() + kHelperInlineLiteralOffset, &bufferAddr, sizeof(bufferAddr));
+	return true;
+}
+
 #define LOG(fmt, ...)                   \
     do {                                \
         if (logsEnabled) {              \
@@ -133,6 +411,7 @@ private:
 	pid_t childPid_ = -1;
 	task_t taskPort_ = MACH_PORT_NULL;
 	std::map<uint64_t, uint32_t> breakpoints_; // addr -> original instruction
+private:
 	std::map<uint64_t, uint32_t> tempBreakpoints_; // addr -> original instruction
 	std::map<uint64_t, uint64_t> tempOrigins_; // temp addr -> breakpoint addr
 	WaitOutcome lastWaitOutcome_ = WaitOutcome::Error;
@@ -245,6 +524,10 @@ public:
 
 	int lastStopSignal() const {
 		return lastStopSignal_;
+	}
+
+	task_t taskPort() const {
+		return taskPort_;
 	}
 
 	bool setBreakpoint(uint64_t address) {
@@ -373,6 +656,10 @@ public:
 			return 0;
 		}
 		return it->second;
+	}
+
+	bool hasBreakpoint(uint64_t address) const {
+		return breakpoints_.find(address) != breakpoints_.end() || tempBreakpoints_.find(address) != tempBreakpoints_.end();
 	}
 
 	enum Register {
@@ -655,6 +942,20 @@ public:
 		return true;
 	}
 
+	bool allocateMemory(uint64_t &address, size_t size, vm_prot_t protection) {
+		mach_vm_address_t allocAddr = 0;
+		kern_return_t kr = mach_vm_allocate(taskPort_, &allocAddr, size, VM_FLAGS_ANYWHERE);
+		if (kr != KERN_SUCCESS) {
+			fprintf(stderr, "Failed to allocate memory in target (error 0x%x: %s)\n", kr, mach_error_string(kr));
+			return false;
+		}
+		if (!adjustMemoryProtection(allocAddr, protection, size)) {
+			return false;
+		}
+		address = allocAddr;
+		return true;
+	}
+
 	bool copyThreadState(arm_thread_state64_t &state) {
 		thread_act_port_array_t threadList;
 		mach_msg_type_number_t threadCount;
@@ -744,10 +1045,110 @@ public:
 
 		return 0;
 	}
+
 };
 
 // Define the static constant outside the class
 const unsigned int MuhDebugger::AARCH64_BREAKPOINT = 0xD4200000;
+
+struct HelperInlineState {
+	uint64_t stubAddr = 0;
+	uint64_t bufferAddr = 0;
+	uint64_t bufferBase = 0;
+};
+
+static bool setupHelperInlineHook(MuhDebugger &dbg,
+                                  uint64_t runtimeBase,
+                                  uint64_t helperSyscallAddr,
+                                  HelperInlineState &state) {
+	std::vector<unsigned char> runtimeBuffer;
+	if (!loadFileBuffer("/usr/libexec/rosetta/runtime", runtimeBuffer)) {
+		fprintf(stderr, "Failed to read rosetta runtime for inline helper hook.\n");
+		return false;
+	}
+	std::vector<MachSegmentInfo> segments;
+	std::vector<MachSectionInfo> sections;
+	if (!parseMachO(runtimeBuffer, segments, sections)) {
+		fprintf(stderr, "Failed to parse rosetta runtime Mach-O for inline helper hook.\n");
+		return false;
+	}
+
+	const auto textVmaddr = findSegmentVmaddr(segments, "__TEXT");
+	if (!textVmaddr) {
+		fprintf(stderr, "Failed to locate __TEXT segment for inline helper hook.\n");
+		return false;
+	}
+
+	const auto caveOffset = findZeroCave(runtimeBuffer, segments, sections, kHelperInlineStubSize, 8, VM_PROT_EXECUTE, true);
+	if (!caveOffset) {
+		fprintf(stderr, "Failed to locate executable code cave for inline helper hook.\n");
+		return false;
+	}
+
+	const auto caveVmaddr = fileOffsetToVmAddr(segments, *caveOffset);
+	if (!caveVmaddr) {
+		fprintf(stderr, "Failed to map code cave to runtime address.\n");
+		return false;
+	}
+
+	const uint64_t slide = runtimeBase - *textVmaddr;
+	const uint64_t stubAddr = slide + *caveVmaddr;
+
+	uint64_t bufferAddr = 0;
+	const size_t bufferAllocSize = kHelperInlineBufferSize + kHelperInlineHeaderSize;
+	if (!dbg.allocateMemory(bufferAddr, bufferAllocSize, VM_PROT_READ | VM_PROT_WRITE)) {
+		fprintf(stderr, "Failed to allocate helper inline buffer in target.\n");
+		return false;
+	}
+
+	uint32_t originalInstr = 0;
+	if (!dbg.readMemory(helperSyscallAddr, &originalInstr, sizeof(originalInstr))) {
+		fprintf(stderr, "Failed to read helper_syscall prologue for inline hook.\n");
+		return false;
+	}
+
+	std::vector<uint8_t> stub;
+	if (!buildHelperInlineStub(originalInstr, stubAddr, helperSyscallAddr + 4, bufferAddr, stub)) {
+		fprintf(stderr, "Failed to build helper inline stub.\n");
+		return false;
+	}
+
+	if (!dbg.adjustMemoryProtection(stubAddr, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, stub.size())) {
+		fprintf(stderr, "Failed to adjust protection for helper inline stub.\n");
+		return false;
+	}
+	if (!dbg.writeMemory(stubAddr, stub.data(), stub.size())) {
+		fprintf(stderr, "Failed to write helper inline stub.\n");
+		return false;
+	}
+	if (!dbg.adjustMemoryProtection(stubAddr, VM_PROT_READ | VM_PROT_EXECUTE, stub.size())) {
+		fprintf(stderr, "Failed to restore protection for helper inline stub.\n");
+		return false;
+	}
+
+	auto branchToStub = encodeBranch(helperSyscallAddr, stubAddr);
+	if (!branchToStub) {
+		fprintf(stderr, "Inline stub out of range for helper_syscall.\n");
+		return false;
+	}
+	if (!dbg.adjustMemoryProtection(helperSyscallAddr, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, sizeof(uint32_t))) {
+		fprintf(stderr, "Failed to adjust protection for helper_syscall patch.\n");
+		return false;
+	}
+	if (!dbg.writeMemory(helperSyscallAddr, &(*branchToStub), sizeof(*branchToStub))) {
+		fprintf(stderr, "Failed to patch helper_syscall entry for inline hook.\n");
+		return false;
+	}
+	if (!dbg.adjustMemoryProtection(helperSyscallAddr, VM_PROT_READ | VM_PROT_EXECUTE, sizeof(uint32_t))) {
+		fprintf(stderr, "Failed to restore protection for helper_syscall patch.\n");
+		return false;
+	}
+
+	state.stubAddr = stubAddr;
+	state.bufferAddr = bufferAddr;
+	state.bufferBase = bufferAddr + kHelperInlineHeaderSize;
+	return true;
+}
 
 int main(int argc, char *argv[]) {
 	if (argc < 2) {
@@ -756,18 +1157,44 @@ int main(int argc, char *argv[]) {
 	}
 
 	logsEnabled = getenv("ROSETTA_X87_LOGS");
-	const bool resolveLogAll = getenv("ROSETTA_RESOLVE_LOG_ALL") != nullptr;
-	std::unordered_set<uint64_t> resolveSeen;
 	const std::string targetPath = argc > 1 ? argv[1] : "";
 	const bool passSigtrapBrk = getenv("ROSETTA_PASS_SIGTRAP") != nullptr;
 	const bool redirectSigsysBrk = getenv("ROSETTA_SKIP_SIGSYS_REDIRECT") == nullptr;
 	const bool skipWinebootHook = getenv("ROSETTA_SKIP_WINEBOOT") != nullptr;
-	size_t resolveHookLimit = 100;
-	if (const char *limitEnv = getenv("ROSETTA_RESOLVE_HOOK_LIMIT")) {
-		resolveHookLimit = strtoull(limitEnv, nullptr, 10);
+	const bool inlineHelperHook = getenv("ASTROWINE_HELPER_INLINE") != nullptr;
+	int inlinePollMs = 50;
+	if (const char *pollEnv = getenv("ASTROWINE_HELPER_INLINE_POLL_MS")) {
+		char *end = nullptr;
+		const long parsed = strtol(pollEnv, &end, 10);
+		if (end != pollEnv && parsed > 0 && parsed < 10000) {
+			inlinePollMs = static_cast<int>(parsed);
+		}
 	}
-	bool resolveHookEnabled = resolveHookLimit != 0;
-	size_t resolveHookCount = 0;
+	const char *svcEnv = getenv("ROSETTA_SVC_HOOKS");
+	const bool svcHooksEnabled = !(svcEnv && strcmp(svcEnv, "0") == 0);
+	const bool svcScanAllExec = getenv("ROSETTA_SVC_SCAN_ALL_EXEC") != nullptr;
+	uint64_t svcFilterValue = 0;
+	bool svcFilterEnabled = false;
+	if (const char *filterEnv = getenv("ROSETTA_SVC_FILTER_VALUE")) {
+		errno = 0;
+		char *end = nullptr;
+		const unsigned long long value = strtoull(filterEnv, &end, 0);
+		if (errno == 0 && end != filterEnv) {
+			svcFilterEnabled = true;
+			svcFilterValue = static_cast<uint64_t>(value);
+		}
+	}
+	size_t svcScanInterval = 50;
+	if (const char *scanEnv = getenv("ROSETTA_SVC_SCAN_INTERVAL")) {
+		svcScanInterval = strtoull(scanEnv, nullptr, 10);
+	}
+	if (svcScanInterval == 0) {
+		svcScanInterval = 1;
+	}
+	std::unordered_set<uint64_t> svcBreakpointAddrs;
+	std::unordered_map<uint64_t, uint32_t> svcOriginalInstr;
+	std::unordered_map<uint64_t, mach_vm_size_t> svcScannedRegions;
+	size_t svcScanTick = 0;
 	bool isWineboot = false;
 	for (int i = 1; i < argc; i++) {
 		if (strstr(argv[i], "wineboot.exe") != nullptr) {
@@ -814,8 +1241,7 @@ int main(int argc, char *argv[]) {
 		return 0;
 	}
 	LOG("Found rosetta runtime helper offsets successfully!\n");
-	LOG("offset_helper_syscall=%llx offset_helper_resolve_addr=%llx\n",
-	    offsetFinder.offsetHelperSyscall_, offsetFinder.offsetHelperResolveAddr_);
+	LOG("offset_helper_syscall=%llx\n", offsetFinder.offsetHelperSyscall_);
 
 	const auto runtimeBase = dbg.findRuntime();
 
@@ -828,21 +1254,235 @@ int main(int argc, char *argv[]) {
 	}
 
 	const auto helperSyscallAddr = runtimeBase + offsetFinder.offsetHelperSyscall_;
-	const auto helperResolveAddr = runtimeBase + offsetFinder.offsetHelperResolveAddr_;
 
 	LOG("helper_syscall address: 0x%llx\n", helperSyscallAddr);
-	LOG("helper_resolve_addr address: 0x%llx\n", helperResolveAddr);
 
-	if (!dbg.setBreakpoint(helperSyscallAddr) ||
-	    (resolveHookEnabled && !dbg.setBreakpoint(helperResolveAddr))) {
-		fprintf(stderr, "Failed to set helper breakpoints\n");
-		dbg.detach();
-		return 1;
+	bool helperInlineActive = false;
+	HelperInlineState helperInlineState;
+	if (inlineHelperHook) {
+		initHookLog();
+		if (!setupHelperInlineHook(dbg, runtimeBase, helperSyscallAddr, helperInlineState)) {
+			fprintf(stderr, "Inline helper hook failed; falling back to breakpoint hook.\n");
+		} else {
+			helperInlineActive = true;
+			LOG("helper_inline stub at 0x%llx buffer 0x%llx\n",
+			    static_cast<unsigned long long>(helperInlineState.stubAddr),
+			    static_cast<unsigned long long>(helperInlineState.bufferAddr));
+		}
+	}
+
+	if (!helperInlineActive) {
+		if (!dbg.setBreakpoint(helperSyscallAddr)) {
+			fprintf(stderr, "Failed to set helper_syscall breakpoint\n");
+			dbg.detach();
+			return 1;
+		}
+	}
+
+	{
+		const std::vector<uint8_t> allowPattern = {
+			0x70, 0x3C, 0x80, 0xD2, 0x01, 0x10, 0x00, 0xD4, 0x01, 0x00,
+			0x80, 0x92, 0x20, 0x20, 0x80, 0x9A, 0xC0, 0x03, 0x5F, 0xD6
+		};
+		const auto allowOffset = findPatternInFile("/usr/libexec/rosetta/runtime", allowPattern);
+		if (allowOffset) {
+			const uint64_t allowAddr = runtimeBase + *allowOffset;
+			const uint32_t patch[2] = {0x52800000u, 0xD65F03C0u}; // mov w0,#0; ret
+			if (!dbg.adjustMemoryProtection(allowAddr, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, sizeof(patch))) {
+				hookLog("[allow_apple_internal] failed to change protection at 0x%llx\n", allowAddr);
+			} else if (!dbg.writeMemory(allowAddr, patch, sizeof(patch))) {
+				hookLog("[allow_apple_internal] failed to patch at 0x%llx\n", allowAddr);
+			} else if (!dbg.adjustMemoryProtection(allowAddr, VM_PROT_READ | VM_PROT_EXECUTE, sizeof(patch))) {
+				hookLog("[allow_apple_internal] failed to restore protection at 0x%llx\n", allowAddr);
+			} else {
+				hookLog("[allow_apple_internal] patched at 0x%llx\n", allowAddr);
+			}
+		} else {
+			hookLog("[allow_apple_internal] pattern not found in /usr/libexec/rosetta/runtime\n");
+		}
+	}
+
+	std::atomic<bool> inlineLogRunning{false};
+	std::thread inlineLogThread;
+	if (helperInlineActive && hookLogsEnabled) {
+		inlineLogRunning.store(true);
+		inlineLogThread = std::thread([&]() {
+			uint64_t readIndex = 0;
+			while (inlineLogRunning.load()) {
+				uint64_t writeIndex = 0;
+				if (!dbg.readMemory(helperInlineState.bufferAddr, &writeIndex, sizeof(writeIndex))) {
+					std::this_thread::sleep_for(std::chrono::milliseconds(inlinePollMs));
+					continue;
+				}
+				while (readIndex != writeIndex && inlineLogRunning.load()) {
+					HelperInlineEntry entry{};
+					const uint64_t entryAddr = helperInlineState.bufferBase + readIndex;
+					if (!dbg.readMemory(entryAddr, &entry, sizeof(entry))) {
+						break;
+					}
+					hookLog("[helper_syscall_inline] svc=0x%08x rcx=0x%llx rdx=0x%llx rbx=0x%llx rsp=0x%llx rbp=0x%llx rsi=0x%llx rdi=0x%llx r8=0x%llx\n",
+					        static_cast<uint32_t>(entry.regs[0] & 0xffffffffu), entry.regs[1], entry.regs[2], entry.regs[3],
+					        entry.regs[4], entry.regs[5], entry.regs[6], entry.regs[7], entry.regs[8]);
+					readIndex = (readIndex + kHelperInlineEntrySize) & kHelperInlineBufferMask;
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(inlinePollMs));
+			}
+		});
 	}
 
 	int pendingSignal = 0;
 	size_t signalLogCount = 0;
 	size_t trapLogCount = 0;
+	struct SegmentRange {
+		uint64_t start;
+		uint64_t end;
+	};
+	auto collectImageSegments = [&]() -> std::vector<SegmentRange> {
+		std::vector<SegmentRange> segments;
+		kern_return_t kr = KERN_SUCCESS;
+		auto processInfo = _dyld_process_info_create(dbg.taskPort(), 0, &kr);
+		if (kr != KERN_SUCCESS) {
+			return segments;
+		}
+		__block std::vector<uint64_t> imageBases;
+		_dyld_process_info_for_each_image(processInfo, ^(uint64_t address, const uuid_t, const char *) {
+			imageBases.push_back(address);
+		});
+		_dyld_process_info_release(processInfo);
+
+		for (const auto base : imageBases) {
+			mach_header_64 header{};
+			if (!dbg.readMemory(base, &header, sizeof(header))) {
+				continue;
+			}
+			if (header.magic != MH_MAGIC_64) {
+				continue;
+			}
+			uint64_t cmdAddr = base + sizeof(header);
+			for (uint32_t i = 0; i < header.ncmds; i++) {
+				load_command cmd{};
+				if (!dbg.readMemory(cmdAddr, &cmd, sizeof(cmd))) {
+					break;
+				}
+				if (cmd.cmd == LC_SEGMENT_64) {
+					segment_command_64 seg{};
+					if (!dbg.readMemory(cmdAddr, &seg, sizeof(seg))) {
+						break;
+					}
+					const uint64_t segStart = base + seg.vmaddr;
+					const uint64_t segEnd = segStart + seg.vmsize;
+					if (seg.vmsize != 0) {
+						segments.push_back({segStart, segEnd});
+					}
+				}
+				if (cmd.cmdsize == 0) {
+					break;
+				}
+				cmdAddr += cmd.cmdsize;
+			}
+		}
+		std::sort(segments.begin(), segments.end(), [](const SegmentRange &a, const SegmentRange &b) {
+			return a.start < b.start;
+		});
+		return segments;
+	};
+	auto regionIntersectsImage = [&](uint64_t start, uint64_t end, const std::vector<SegmentRange> &segments) -> bool {
+		for (const auto &seg : segments) {
+			if (end <= seg.start) {
+				break;
+			}
+			if (start < seg.end && end > seg.start) {
+				return true;
+			}
+		}
+		return false;
+	};
+	auto scanSvcBreakpoints = [&]() {
+		if (!svcHooksEnabled) {
+			return;
+		}
+		task_t task = dbg.taskPort();
+		if (task == MACH_PORT_NULL) {
+			return;
+		}
+		mach_vm_address_t address = 0;
+		mach_vm_size_t size = 0;
+		vm_region_basic_info_data_64_t info;
+		mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+		mach_port_t objectName = MACH_PORT_NULL;
+		size_t added = 0;
+		const size_t chunkSize = 0x4000;
+		std::vector<SegmentRange> imageSegments;
+		if (svcScanAllExec) {
+			imageSegments = collectImageSegments();
+		}
+		while (true) {
+			count = VM_REGION_BASIC_INFO_COUNT_64;
+			if (mach_vm_region(task, &address, &size, VM_REGION_BASIC_INFO_64,
+			                   (vm_region_info_t)&info, &count, &objectName) != KERN_SUCCESS) {
+				break;
+			}
+
+			const bool isExecutable = (info.protection & VM_PROT_EXECUTE) != 0;
+			const bool isWritable = (info.protection & VM_PROT_WRITE) != 0;
+			if (!isExecutable) {
+				address += size;
+				continue;
+			}
+			if (!svcScanAllExec && !isWritable) {
+				address += size;
+				continue;
+			}
+			const uint64_t regionEnd = static_cast<uint64_t>(address + size);
+			if (svcScanAllExec && regionIntersectsImage(static_cast<uint64_t>(address), regionEnd, imageSegments)) {
+				address += size;
+				continue;
+			}
+			if (!isWritable) {
+				auto it = svcScannedRegions.find(address);
+				if (it != svcScannedRegions.end() && it->second == size) {
+					address += size;
+					continue;
+				}
+				svcScannedRegions[address] = size;
+			}
+
+			for (mach_vm_address_t offset = 0; offset < size; offset += chunkSize) {
+				const size_t readSize = static_cast<size_t>(std::min<mach_vm_size_t>(chunkSize, size - offset));
+				std::vector<uint8_t> buffer(readSize);
+				if (!dbg.readMemory(address + offset, buffer.data(), readSize)) {
+					continue;
+				}
+				for (size_t i = 0; i + 4 <= readSize; i += 4) {
+					const uint32_t instr = static_cast<uint32_t>(buffer[i]) |
+					                       (static_cast<uint32_t>(buffer[i + 1]) << 8) |
+					                       (static_cast<uint32_t>(buffer[i + 2]) << 16) |
+					                       (static_cast<uint32_t>(buffer[i + 3]) << 24);
+					if ((instr & 0xFFE0001F) != 0xD4000001) {
+						continue;
+					}
+					const uint64_t instrAddr = static_cast<uint64_t>(address + offset + i);
+					if (svcBreakpointAddrs.find(instrAddr) != svcBreakpointAddrs.end()) {
+						continue;
+					}
+					if (!dbg.setBreakpoint(instrAddr)) {
+						continue;
+					}
+					svcBreakpointAddrs.insert(instrAddr);
+					svcOriginalInstr[instrAddr] = instr;
+					added++;
+				}
+			}
+
+			address += size;
+		}
+		if (added > 0) {
+			hookLog("[svc_scan] added=%zu total=%zu\n", added, svcBreakpointAddrs.size());
+		}
+	};
+	if (svcHooksEnabled) {
+		scanSvcBreakpoints();
+	}
 	while (true) {
 		if (!dbg.continueExecution(pendingSignal)) {
 			auto outcome = dbg.lastWaitOutcome();
@@ -853,6 +1493,12 @@ int main(int argc, char *argv[]) {
 			break;
 		}
 		pendingSignal = 0;
+		if (svcHooksEnabled) {
+			svcScanTick++;
+			if (svcScanTick % svcScanInterval == 0) {
+				scanSvcBreakpoints();
+			}
+		}
 
 		const int stopSignal = dbg.lastStopSignal();
 		if (stopSignal != SIGTRAP) {
@@ -912,7 +1558,6 @@ int main(int argc, char *argv[]) {
 
 		if (dbg.isTempBreakpoint(hitAddr)) {
 			const uint64_t originAddr = dbg.tempOrigin(hitAddr);
-			const bool restoreOrigin = !(originAddr == helperResolveAddr && !resolveHookEnabled);
 			if (!dbg.removeTempBreakpoint(hitAddr)) {
 				fprintf(stderr, "Failed to remove temp breakpoint at 0x%llx\n", hitAddr);
 				if (hitThread != MACH_PORT_NULL) {
@@ -920,7 +1565,7 @@ int main(int argc, char *argv[]) {
 				}
 				return 1;
 			}
-			if (restoreOrigin && originAddr != 0 && !dbg.setBreakpoint(originAddr)) {
+			if (originAddr != 0 && !dbg.setBreakpoint(originAddr)) {
 				fprintf(stderr, "Failed to restore breakpoint at 0x%llx\n", originAddr);
 				mach_port_deallocate(mach_task_self(), hitThread);
 				return 1;
@@ -930,14 +1575,7 @@ int main(int argc, char *argv[]) {
 		}
 
 		const bool isSyscall = (hitAddr == helperSyscallAddr);
-		const bool isResolve = (hitAddr == helperResolveAddr);
-		if (isResolve && resolveHookEnabled && resolveHookLimit > 0) {
-			resolveHookCount++;
-			if (resolveHookCount > resolveHookLimit) {
-				resolveHookEnabled = false;
-				LOG("Disabling helper_resolve_addr hook after %zu hits\n", resolveHookCount);
-			}
-		}
+		const bool isSvcTrap = svcBreakpointAddrs.find(hitAddr) != svcBreakpointAddrs.end();
 
 		if (isSyscall) {
 			const uint64_t x0 = dbg.readRegister(hitThread, MuhDebugger::Register::X0);
@@ -951,20 +1589,38 @@ int main(int argc, char *argv[]) {
 			const uint64_t x8 = dbg.readRegister(hitThread, MuhDebugger::Register::X8);
 			hookLog("[helper_syscall] svc=0x%08x rcx=0x%llx rdx=0x%llx rbx=0x%llx rsp=0x%llx rbp=0x%llx rsi=0x%llx rdi=0x%llx r8=0x%llx\n",
 			        static_cast<uint32_t>(x0 & 0xffffffffu), x1, x2, x3, x4, x5, x6, x7, x8);
-		} else {
+		} else if (isSvcTrap) {
+			const auto svcIt = svcOriginalInstr.find(hitAddr);
+			const uint32_t svcInstr = (svcIt != svcOriginalInstr.end()) ? svcIt->second : 0;
+			const uint32_t svcImm = (svcInstr >> 5) & 0xFFFF;
 			const uint64_t x0 = dbg.readRegister(hitThread, MuhDebugger::Register::X0);
 			const uint64_t x1 = dbg.readRegister(hitThread, MuhDebugger::Register::X1);
 			const uint64_t x2 = dbg.readRegister(hitThread, MuhDebugger::Register::X2);
-			bool shouldLog = resolveLogAll;
-			if (!shouldLog) {
-				auto inserted = resolveSeen.insert(x1).second;
-				shouldLog = inserted;
-				if (resolveSeen.size() > 100000) {
-					resolveSeen.clear();
+			const uint64_t x3 = dbg.readRegister(hitThread, MuhDebugger::Register::X3);
+			const uint64_t x4 = dbg.readRegister(hitThread, MuhDebugger::Register::X4);
+			const uint64_t x5 = dbg.readRegister(hitThread, MuhDebugger::Register::X5);
+			const uint64_t x6 = dbg.readRegister(hitThread, MuhDebugger::Register::X6);
+			const uint64_t x7 = dbg.readRegister(hitThread, MuhDebugger::Register::X7);
+			const uint64_t x8 = dbg.readRegister(hitThread, MuhDebugger::Register::X8);
+			const uint64_t x16 = dbg.readRegister(hitThread, MuhDebugger::Register::X16);
+			bool filterMatch = true;
+			if (svcFilterEnabled) {
+				filterMatch = false;
+				const uint64_t regs[] = {x0, x1, x2, x3, x4, x5, x6, x7, x8, x16};
+				for (const auto reg : regs) {
+					if (reg == svcFilterValue) {
+						filterMatch = true;
+						break;
+					}
+					if (svcFilterValue <= 0xffffffffu && (reg & 0xffffffffu) == svcFilterValue) {
+						filterMatch = true;
+						break;
+					}
 				}
 			}
-			if (shouldLog) {
-				hookLog("[helper_resolve_addr] context=0x%llx x86_address=0x%llx stubs_sh=0x%llx\n", x0, x1, x2);
+			if (filterMatch) {
+				hookLog("[svc_trap] pc=0x%llx svc_imm=0x%04x x16=0x%llx x8=0x%llx x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx x4=0x%llx x5=0x%llx x6=0x%llx x7=0x%llx\n",
+				        hitAddr, svcImm, x16, x8, x0, x1, x2, x3, x4, x5, x6, x7);
 			}
 		}
 
@@ -976,16 +1632,21 @@ int main(int argc, char *argv[]) {
 			return 1;
 		}
 
-		if (!(isResolve && !resolveHookEnabled)) {
-			const uint64_t tempAddr = hitAddr + 4;
-			if (!dbg.setTempBreakpoint(tempAddr, hitAddr)) {
-				fprintf(stderr, "Failed to set temp breakpoint at 0x%llx\n", tempAddr);
-				mach_port_deallocate(mach_task_self(), hitThread);
-				return 1;
-			}
+		const uint64_t tempAddr = hitAddr + 4;
+		if (!dbg.setTempBreakpoint(tempAddr, hitAddr)) {
+			fprintf(stderr, "Failed to set temp breakpoint at 0x%llx\n", tempAddr);
+			mach_port_deallocate(mach_task_self(), hitThread);
+			return 1;
 		}
 
 		mach_port_deallocate(mach_task_self(), hitThread);
+	}
+
+	if (inlineLogRunning.load()) {
+		inlineLogRunning.store(false);
+	}
+	if (inlineLogThread.joinable()) {
+		inlineLogThread.join();
 	}
 
 	if (dbg.lastWaitOutcome() == MuhDebugger::WaitOutcome::Stopped) {
