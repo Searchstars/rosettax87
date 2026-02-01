@@ -466,6 +466,40 @@ static uint32_t encodeMovk(uint8_t reg, uint16_t imm16, uint8_t shift) {
 	return 0xF2800000u | (static_cast<uint32_t>(imm16) << 5) | (hw << 21) | (reg & 0x1fu);
 }
 
+static uint32_t encodeAddImm(uint8_t dst, uint8_t src, uint16_t imm12) {
+	return 0x91000000u | (static_cast<uint32_t>(imm12 & 0x0fffu) << 10) | ((src & 0x1fu) << 5) | (dst & 0x1fu);
+}
+
+static uint32_t encodeSubImm(uint8_t dst, uint8_t src, uint16_t imm12) {
+	return 0xD1000000u | (static_cast<uint32_t>(imm12 & 0x0fffu) << 10) | ((src & 0x1fu) << 5) | (dst & 0x1fu);
+}
+
+static uint32_t encodeStrImm(uint8_t rt, uint8_t rn, uint16_t immBytes) {
+	const uint32_t imm12 = static_cast<uint32_t>((immBytes >> 3) & 0x0fffu);
+	return 0xF9000000u | (imm12 << 10) | ((rn & 0x1fu) << 5) | (rt & 0x1fu);
+}
+
+static uint32_t encodeLdrImm(uint8_t rt, uint8_t rn, uint16_t immBytes) {
+	const uint32_t imm12 = static_cast<uint32_t>((immBytes >> 3) & 0x0fffu);
+	return 0xF9400000u | (imm12 << 10) | ((rn & 0x1fu) << 5) | (rt & 0x1fu);
+}
+
+static uint32_t encodeStpImm(uint8_t rt, uint8_t rt2, uint8_t rn, int16_t immBytes) {
+	const int16_t imm7 = static_cast<int16_t>(immBytes >> 3);
+	return 0xA9000000u | ((static_cast<uint32_t>(imm7) & 0x7fu) << 15) |
+	       ((rt2 & 0x1fu) << 10) | ((rn & 0x1fu) << 5) | (rt & 0x1fu);
+}
+
+static uint32_t encodeLdpImm(uint8_t rt, uint8_t rt2, uint8_t rn, int16_t immBytes) {
+	const int16_t imm7 = static_cast<int16_t>(immBytes >> 3);
+	return 0xA9400000u | ((static_cast<uint32_t>(imm7) & 0x7fu) << 15) |
+	       ((rt2 & 0x1fu) << 10) | ((rn & 0x1fu) << 5) | (rt & 0x1fu);
+}
+
+static uint32_t encodeSvc(uint16_t imm16) {
+	return 0xD4000001u | (static_cast<uint32_t>(imm16) << 5);
+}
+
 static void encodeAbsoluteBranch(uint64_t target, uint8_t reg, uint32_t outInstrs[5]) {
 	outInstrs[0] = encodeMovz(reg, static_cast<uint16_t>(target & 0xffffu), 0);
 	outInstrs[1] = encodeMovk(reg, static_cast<uint16_t>((target >> 16) & 0xffffu), 16);
@@ -621,6 +655,7 @@ constexpr size_t kHelperInlineOrig4Offset = 0x58;
 constexpr size_t kHelperInlineOrig5Offset = 0x5c;
 constexpr size_t kHelperInlineBranchOffset = 0x60;
 constexpr size_t kHelperInlineLiteralOffset = 0x70;
+constexpr size_t kHelperInlineDirectOrigOffset = 0x48;
 constexpr size_t kHelperInlineEntrySize = 0x80;
 constexpr size_t kHelperInlineBufferSize = 0x2000;
 constexpr size_t kHelperInlineBufferMask = kHelperInlineBufferSize - 1;
@@ -704,6 +739,69 @@ static bool buildHelperInlineMinimalStub(uint32_t originalInstr0,
 	uint32_t branchInstrs[5] = {};
 	encodeAbsoluteBranch(returnAddr, 17, branchInstrs);
 	memcpy(outStub.data() + 20, branchInstrs, sizeof(branchInstrs));
+	return true;
+}
+
+static bool buildHelperInlineDirectWriteStub(uint32_t originalInstr0,
+                                             uint32_t originalInstr1,
+                                             uint32_t originalInstr2,
+                                             uint32_t originalInstr3,
+                                             uint32_t originalInstr4,
+                                             uint64_t returnAddr,
+                                             std::vector<uint8_t> &outStub) {
+	std::vector<uint32_t> instrs;
+	instrs.reserve(32);
+
+	// Stack frame 0x50 bytes, save x0-x2, x16-x17, write x0-x3 to stderr.
+	instrs.push_back(encodeSubImm(31, 31, 0x50));        // sub sp, sp, #0x50
+	instrs.push_back(encodeStpImm(0, 1, 31, 0x00));       // stp x0, x1, [sp,#0]
+	instrs.push_back(encodeStrImm(2, 31, 0x10));          // str x2, [sp,#0x10]
+	instrs.push_back(encodeStpImm(16, 17, 31, 0x18));     // stp x16, x17, [sp,#0x18]
+
+	instrs.push_back(encodeStrImm(0, 31, 0x28));          // str x0, [sp,#0x28]
+	instrs.push_back(encodeStrImm(1, 31, 0x30));          // str x1, [sp,#0x30]
+	instrs.push_back(encodeStrImm(2, 31, 0x38));          // str x2, [sp,#0x38]
+	instrs.push_back(encodeStrImm(3, 31, 0x40));          // str x3, [sp,#0x40]
+
+	instrs.push_back(encodeMovz(0, 2, 0));                // mov x0, #2 (stderr)
+	instrs.push_back(encodeAddImm(1, 31, 0x28));          // add x1, sp, #0x28
+	instrs.push_back(encodeMovz(2, 0x20, 0));             // mov x2, #0x20 (32 bytes)
+
+	const uint64_t sysWrite = 0x2000004ull;
+	instrs.push_back(encodeMovz(16, static_cast<uint16_t>(sysWrite & 0xffffu), 0));
+	const uint16_t sysWriteHi = static_cast<uint16_t>((sysWrite >> 16) & 0xffffu);
+	instrs.push_back(encodeMovk(16, sysWriteHi, 16));
+	instrs.push_back(encodeSvc(0x80));                   // svc #0x80
+
+	instrs.push_back(encodeLdpImm(16, 17, 31, 0x18));     // ldp x16, x17, [sp,#0x18]
+	instrs.push_back(encodeLdpImm(0, 1, 31, 0x00));       // ldp x0, x1, [sp,#0]
+	instrs.push_back(encodeLdrImm(2, 31, 0x10));          // ldr x2, [sp,#0x10]
+	instrs.push_back(encodeAddImm(31, 31, 0x50));         // add sp, sp, #0x50
+
+	const size_t prologueBytes = instrs.size() * sizeof(uint32_t);
+	if (prologueBytes != kHelperInlineDirectOrigOffset) {
+		return false;
+	}
+
+	instrs.push_back(originalInstr0);
+	instrs.push_back(originalInstr1);
+	instrs.push_back(originalInstr2);
+	instrs.push_back(originalInstr3);
+	instrs.push_back(originalInstr4);
+
+	uint32_t branchInstrs[5] = {};
+	encodeAbsoluteBranch(returnAddr, 17, branchInstrs);
+	for (const auto instr : branchInstrs) {
+		instrs.push_back(instr);
+	}
+
+	outStub.assign(kHelperInlineStubSize, 0);
+	fillNops(outStub);
+	const size_t byteCount = instrs.size() * sizeof(uint32_t);
+	if (byteCount > kHelperInlineStubSize) {
+		return false;
+	}
+	memcpy(outStub.data(), instrs.data(), byteCount);
 	return true;
 }
 
@@ -1600,6 +1698,7 @@ static bool setupHelperInlineHook(MuhDebugger &dbg,
                                   uint64_t helperSyscallAddr,
                                   uint64_t runtimeBase,
                                   bool enableLogging,
+                                  bool directLogging,
                                   bool minimalStub,
                                   HelperInlineState &state) {
 	mach_vm_address_t regionStart = 0;
@@ -1639,7 +1738,7 @@ static bool setupHelperInlineHook(MuhDebugger &dbg,
 	}
 	const uint64_t stubAddr = *caveAddr;
 
-	const bool useLogging = enableLogging && !minimalStub;
+	const bool useLogging = enableLogging && !minimalStub && !directLogging;
 	uint64_t bufferAddr = 0;
 	if (useLogging) {
 		const size_t bufferSize = kHelperInlineHeaderSize + kHelperInlineBufferSize;
@@ -1685,7 +1784,12 @@ static bool setupHelperInlineHook(MuhDebugger &dbg,
 	uint32_t relocated2 = 0;
 	uint32_t relocated3 = 0;
 	uint32_t relocated4 = 0;
-	const uint64_t relocateBase = minimalStub ? stubAddr : (stubAddr + kHelperInlineOrigOffset);
+	uint64_t relocateBase = stubAddr + kHelperInlineOrigOffset;
+	if (directLogging) {
+		relocateBase = stubAddr + kHelperInlineDirectOrigOffset;
+	} else if (minimalStub) {
+		relocateBase = stubAddr;
+	}
 	if (!relocateInstruction(originalInstr0, helperSyscallAddr, relocateBase, relocated0) ||
 	    !relocateInstruction(originalInstr1, helperSyscallAddr + 4, relocateBase + 4, relocated1) ||
 	    !relocateInstruction(originalInstr2, helperSyscallAddr + 8, relocateBase + 8, relocated2) ||
@@ -1696,7 +1800,13 @@ static bool setupHelperInlineHook(MuhDebugger &dbg,
 	}
 
 	std::vector<uint8_t> stub;
-	if (minimalStub) {
+	if (directLogging) {
+		if (!buildHelperInlineDirectWriteStub(relocated0, relocated1, relocated2, relocated3, relocated4,
+		                                      helperSyscallAddr + 20, stub)) {
+			fprintf(stderr, "Failed to build helper inline direct stub.\n");
+			return false;
+		}
+	} else if (minimalStub) {
 		if (!buildHelperInlineMinimalStub(relocated0, relocated1, relocated2, relocated3, relocated4,
 		                                  helperSyscallAddr + 20, stub)) {
 			fprintf(stderr, "Failed to build helper inline minimal stub.\n");
@@ -1769,6 +1879,7 @@ int main(int argc, char *argv[]) {
 	const bool skipWinebootHook = getenvPrefer("ASTROWINE_SKIP_WINEBOOT", "ROSETTA_SKIP_WINEBOOT") != nullptr;
 	const bool inlineHelperHook = getenv("ASTROWINE_HELPER_INLINE") != nullptr;
 	const bool inlineMinimalStub = getenv("ASTROWINE_HELPER_INLINE_MINIMAL") != nullptr;
+	const bool inlineDirectLogging = getenv("ASTROWINE_HELPER_INLINE_DIRECT") != nullptr;
 	const bool detachAfterHook = getenv("ASTROWINE_DETACH") != nullptr;
 	const bool helperHooksEnabled = []() {
 		const char *env = getenv("ASTROWINE_HELPER_HOOKS");
@@ -1881,13 +1992,14 @@ int main(int argc, char *argv[]) {
 	bool helperInlineActive = false;
 	HelperInlineState helperInlineState;
 	if (helperHooksEnabled) {
-	if (inlineHelperHook) {
-		initHookLog();
-		const bool useMinimalStub = inlineMinimalStub;
-		if (!setupHelperInlineHook(dbg, helperSyscallAddr, runtimeBase, hookLogsEnabled, useMinimalStub, helperInlineState)) {
-			fprintf(stderr, "Inline helper hook failed; falling back to breakpoint hook.\n");
-		} else {
-			helperInlineActive = true;
+		if (inlineHelperHook) {
+			initHookLog();
+			const bool useMinimalStub = inlineMinimalStub;
+			const bool useDirectLogging = inlineDirectLogging && hookLogsEnabled;
+			if (!setupHelperInlineHook(dbg, helperSyscallAddr, runtimeBase, hookLogsEnabled, useDirectLogging, useMinimalStub, helperInlineState)) {
+				fprintf(stderr, "Inline helper hook failed; falling back to breakpoint hook.\n");
+			} else {
+				helperInlineActive = true;
 			LOG("helper_inline stub at 0x%llx buffer 0x%llx\n",
 			    static_cast<unsigned long long>(helperInlineState.stubAddr),
 			    static_cast<unsigned long long>(helperInlineState.bufferAddr));
@@ -1934,25 +2046,18 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
+	const bool inlineRingLogging = helperInlineActive && hookLogsEnabled && !inlineDirectLogging;
 	bool shouldDetach = detachAfterHook;
 	if (!shouldDetach) {
-		if (helperInlineActive && !hookLogsEnabled && !svcHooksEnabled) {
+		if (helperInlineActive && !svcHooksEnabled && !inlineRingLogging) {
 			shouldDetach = true;
 		} else if (!helperHooksEnabled && !svcHooksEnabled && !hookLogsEnabled) {
 			shouldDetach = true;
 		}
 	}
-	if (shouldDetach && !svcHooksEnabled && !hookLogsEnabled && (helperInlineActive || !helperHooksEnabled)) {
-		if (!dbg.detach()) {
-			fprintf(stderr, "Failed to detach debugger\n");
-			return 1;
-		}
-		return 0;
-	}
-
 	std::atomic<bool> inlineLogRunning{false};
 	std::thread inlineLogThread;
-	if (helperInlineActive && hookLogsEnabled && helperInlineState.bufferAddr != 0) {
+	if (inlineRingLogging && helperInlineState.bufferAddr != 0) {
 		inlineLogRunning.store(true);
 		inlineLogThread = std::thread([&]() {
 			uint64_t readIndex = 0;
@@ -1976,6 +2081,26 @@ int main(int argc, char *argv[]) {
 				std::this_thread::sleep_for(std::chrono::milliseconds(inlinePollMs));
 			}
 		});
+	}
+
+	if (shouldDetach && !svcHooksEnabled && (helperInlineActive || !helperHooksEnabled)) {
+		if (!dbg.detach()) {
+			fprintf(stderr, "Failed to detach debugger\n");
+			return 1;
+		}
+		if (inlineLogRunning.load()) {
+			int status = 0;
+			pid_t waited = 0;
+			do {
+				waited = waitpid(child, &status, 0);
+			} while (waited == -1 && errno == EINTR);
+			inlineLogRunning.store(false);
+			if (inlineLogThread.joinable()) {
+				inlineLogThread.join();
+			}
+			return 0;
+		}
+		return 0;
 	}
 
 	int pendingSignal = 0;
