@@ -112,6 +112,14 @@ static void hookLog(const char *fmt, ...) {
 	}
 }
 
+static const char *getenvPrefer(const char *primary, const char *fallback) {
+	const char *value = getenv(primary);
+	if (value) {
+		return value;
+	}
+	return getenv(fallback);
+}
+
 static std::optional<uint64_t> findPatternInFile(const char *path, const std::vector<uint8_t> &pattern) {
 	if (!path || pattern.empty()) {
 		return std::nullopt;
@@ -147,6 +155,32 @@ static std::optional<uint64_t> findPatternInFile(const char *path, const std::ve
 		}
 	}
 	return std::nullopt;
+}
+
+static bool isFileRangeZero(const char *path, uint64_t offset, size_t size) {
+	if (!path || size == 0) {
+		return false;
+	}
+	std::ifstream file(path, std::ios::binary);
+	if (!file) {
+		return false;
+	}
+	file.seekg(0, std::ios::end);
+	const std::streampos fileSize = file.tellg();
+	if (fileSize <= 0 || offset + size > static_cast<uint64_t>(fileSize)) {
+		return false;
+	}
+	file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+	std::vector<unsigned char> buffer(size);
+	if (!file.read(reinterpret_cast<char *>(buffer.data()), size)) {
+		return false;
+	}
+	for (const auto byte : buffer) {
+		if (byte != 0) {
+			return false;
+		}
+	}
+	return true;
 }
 
 struct MachSegmentInfo {
@@ -432,6 +466,14 @@ static uint32_t encodeMovk(uint8_t reg, uint16_t imm16, uint8_t shift) {
 	return 0xF2800000u | (static_cast<uint32_t>(imm16) << 5) | (hw << 21) | (reg & 0x1fu);
 }
 
+static void encodeAbsoluteBranch(uint64_t target, uint8_t reg, uint32_t outInstrs[5]) {
+	outInstrs[0] = encodeMovz(reg, static_cast<uint16_t>(target & 0xffffu), 0);
+	outInstrs[1] = encodeMovk(reg, static_cast<uint16_t>((target >> 16) & 0xffffu), 16);
+	outInstrs[2] = encodeMovk(reg, static_cast<uint16_t>((target >> 32) & 0xffffu), 32);
+	outInstrs[3] = encodeMovk(reg, static_cast<uint16_t>((target >> 48) & 0xffffu), 48);
+	outInstrs[4] = 0xD61F0000u | (static_cast<uint32_t>(reg & 0x1fu) << 5); // br xN
+}
+
 static int64_t signExtend64(int64_t value, int bits) {
 	const int shift = 64 - bits;
 	return (value << shift) >> shift;
@@ -468,6 +510,21 @@ static bool relocateInstruction(uint32_t instr, uint64_t origAddr, uint64_t newA
 		outInstr = 0x14000000u | (static_cast<uint32_t>(newImm) & 0x03ffffffu);
 		return true;
 	}
+	// BL (call)
+	if ((instr & 0xFC000000u) == 0x94000000u) {
+		int64_t imm26 = signExtend64(instr & 0x03ffffffu, 26);
+		const uint64_t target = origAddr + (imm26 << 2);
+		const int64_t diff = static_cast<int64_t>(target) - static_cast<int64_t>(newAddr);
+		if (diff % 4 != 0) {
+			return false;
+		}
+		const int64_t newImm = diff >> 2;
+		if (newImm < -(1LL << 25) || newImm >= (1LL << 25)) {
+			return false;
+		}
+		outInstr = 0x94000000u | (static_cast<uint32_t>(newImm) & 0x03ffffffu);
+		return true;
+	}
 	// CBZ/CBNZ
 	if ((instr & 0x7F000000u) == 0x34000000u) {
 		int64_t imm19 = signExtend64((instr >> 5) & 0x7ffff, 19);
@@ -482,6 +539,74 @@ static bool relocateInstruction(uint32_t instr, uint64_t origAddr, uint64_t newA
 		}
 		outInstr = (instr & 0xFF00001Fu) | ((static_cast<uint32_t>(newImm) & 0x7ffffu) << 5);
 		return true;
+	}
+	// TBZ/TBNZ
+	if ((instr & 0x7F000000u) == 0x36000000u || (instr & 0x7F000000u) == 0x37000000u) {
+		int64_t imm14 = signExtend64((instr >> 5) & 0x3fffu, 14);
+		const uint64_t target = origAddr + (imm14 << 2);
+		const int64_t diff = static_cast<int64_t>(target) - static_cast<int64_t>(newAddr);
+		if (diff % 4 != 0) {
+			return false;
+		}
+		const int64_t newImm = diff >> 2;
+		if (newImm < -(1LL << 13) || newImm >= (1LL << 13)) {
+			return false;
+		}
+		outInstr = (instr & 0xFFF8001Fu) | ((static_cast<uint32_t>(newImm) & 0x3fffu) << 5);
+		return true;
+	}
+	// ADR
+	if ((instr & 0x9F000000u) == 0x10000000u) {
+		const uint32_t immlo = (instr >> 29) & 0x3u;
+		const uint32_t immhi = (instr >> 5) & 0x7ffffu;
+		int64_t imm = signExtend64(static_cast<int64_t>((immhi << 2) | immlo), 21);
+		const uint64_t target = origAddr + static_cast<uint64_t>(imm);
+		const int64_t diff = static_cast<int64_t>(target) - static_cast<int64_t>(newAddr);
+		if (diff < -(1LL << 20) || diff >= (1LL << 20)) {
+			return false;
+		}
+		const uint32_t newImmlo = static_cast<uint32_t>(diff) & 0x3u;
+		const uint32_t newImmhi = (static_cast<uint32_t>(diff) >> 2) & 0x7ffffu;
+		outInstr = (instr & 0x9F00001Fu) | (newImmlo << 29) | (newImmhi << 5);
+		return true;
+	}
+	// ADRP
+	if ((instr & 0x9F000000u) == 0x90000000u) {
+		const uint32_t immlo = (instr >> 29) & 0x3u;
+		const uint32_t immhi = (instr >> 5) & 0x7ffffu;
+		int64_t imm = signExtend64(static_cast<int64_t>((immhi << 2) | immlo), 21);
+		const uint64_t target = (origAddr & ~0xfffull) + (static_cast<uint64_t>(imm) << 12);
+		const uint64_t newBase = newAddr & ~0xfffull;
+		const int64_t diff = static_cast<int64_t>(target) - static_cast<int64_t>(newBase);
+		if (diff % 0x1000 != 0) {
+			return false;
+		}
+		const int64_t newImm = diff >> 12;
+		if (newImm < -(1LL << 20) || newImm >= (1LL << 20)) {
+			return false;
+		}
+		const uint32_t newImmlo = static_cast<uint32_t>(newImm) & 0x3u;
+		const uint32_t newImmhi = (static_cast<uint32_t>(newImm) >> 2) & 0x7ffffu;
+		outInstr = (instr & 0x9F00001Fu) | (newImmlo << 29) | (newImmhi << 5);
+		return true;
+	}
+	// LDR literal (32/64) or LDRSW literal
+	{
+		const uint32_t op = instr & 0xFF000000u;
+		if (op == 0x18000000u || op == 0x58000000u || op == 0x98000000u) {
+			int64_t imm19 = signExtend64((instr >> 5) & 0x7ffff, 19);
+			const uint64_t target = origAddr + (imm19 << 2);
+			const int64_t diff = static_cast<int64_t>(target) - static_cast<int64_t>(newAddr);
+			if (diff % 4 != 0) {
+				return false;
+			}
+			const int64_t newImm = diff >> 2;
+			if (newImm < -(1LL << 18) || newImm >= (1LL << 18)) {
+				return false;
+			}
+			outInstr = (instr & 0xFF00001Fu) | ((static_cast<uint32_t>(newImm) & 0x7ffffu) << 5);
+			return true;
+		}
 	}
 	// Other instructions: unchanged
 	outInstr = instr;
@@ -531,7 +656,7 @@ static bool buildHelperInlineStub(uint32_t originalInstr0,
 		0xEF, 0x01, 0x11, 0x8B, 0xE0, 0x05, 0x00, 0xA9,
 		0xE2, 0x0D, 0x01, 0xA9, 0xE4, 0x15, 0x02, 0xA9,
 		0xE6, 0x1D, 0x03, 0xA9, 0xE8, 0x21, 0x00, 0xF9,
-		0xFF, 0x25, 0x00, 0xF9, 0x31, 0x02, 0x02, 0x91,
+		0xBF, 0x3A, 0x03, 0xD5, 0x31, 0x02, 0x02, 0x91,
 		0x31, 0x32, 0x40, 0x92, 0x11, 0x02, 0x00, 0xF9,
 		0xEF, 0x43, 0x40, 0xA9, 0xF1, 0x0B, 0x40, 0xF9,
 		0xFF, 0x83, 0x00, 0x91, 0xAA, 0xAA, 0xAA, 0xAA,
@@ -559,6 +684,26 @@ static bool buildHelperInlineStub(uint32_t originalInstr0,
 	}
 	memcpy(outStub.data() + kHelperInlineBranchOffset, &(*branch), sizeof(*branch));
 	memcpy(outStub.data() + kHelperInlineLiteralOffset, &literalValue, sizeof(literalValue));
+	return true;
+}
+
+static bool buildHelperInlineMinimalStub(uint32_t originalInstr0,
+                                         uint32_t originalInstr1,
+                                         uint32_t originalInstr2,
+                                         uint32_t originalInstr3,
+                                         uint32_t originalInstr4,
+                                         uint64_t returnAddr,
+                                         std::vector<uint8_t> &outStub) {
+	outStub.assign(kHelperInlineStubSize, 0);
+	fillNops(outStub);
+	memcpy(outStub.data(), &originalInstr0, sizeof(originalInstr0));
+	memcpy(outStub.data() + 4, &originalInstr1, sizeof(originalInstr1));
+	memcpy(outStub.data() + 8, &originalInstr2, sizeof(originalInstr2));
+	memcpy(outStub.data() + 12, &originalInstr3, sizeof(originalInstr3));
+	memcpy(outStub.data() + 16, &originalInstr4, sizeof(originalInstr4));
+	uint32_t branchInstrs[5] = {};
+	encodeAbsoluteBranch(returnAddr, 17, branchInstrs);
+	memcpy(outStub.data() + 20, branchInstrs, sizeof(branchInstrs));
 	return true;
 }
 
@@ -1361,7 +1506,6 @@ static std::optional<uint64_t> findZeroCaveInRegion(MuhDebugger &dbg,
 	const uint64_t regionEnd = regionStart + regionSize;
 	const uint64_t scanStart = minAddr;
 	const size_t chunkSize = 1ull << 20;
-	uint64_t best = 0;
 	uint64_t runStart = 0;
 	size_t runLen = 0;
 	uint64_t cursor = scanStart;
@@ -1384,7 +1528,7 @@ static std::optional<uint64_t> findZeroCaveInRegion(MuhDebugger &dbg,
 				if (runLen >= minSize) {
 					const uint64_t candidate = alignUp(runStart, aligned);
 					if (candidate + minSize <= runStart + runLen) {
-						best = candidate;
+						return candidate;
 					}
 				}
 				runLen = 0;
@@ -1395,10 +1539,55 @@ static std::optional<uint64_t> findZeroCaveInRegion(MuhDebugger &dbg,
 	if (runLen >= minSize) {
 		const uint64_t candidate = alignUp(runStart, aligned);
 		if (candidate + minSize <= runStart + runLen) {
-			best = candidate;
+			return candidate;
 		}
 	}
-	return best != 0 ? std::optional<uint64_t>(best) : std::nullopt;
+	return std::nullopt;
+}
+
+static std::optional<uint64_t> findTrailingZeroCaveInRegion(MuhDebugger &dbg,
+                                                            uint64_t regionStart,
+                                                            uint64_t regionSize,
+                                                            size_t minSize,
+                                                            size_t alignment) {
+	if (regionSize == 0 || minSize == 0 || regionSize < minSize) {
+		return std::nullopt;
+	}
+	const uint64_t regionEnd = regionStart + regionSize;
+	const size_t chunkSize = 1ull << 20;
+	uint64_t remaining = regionSize;
+	size_t runLen = 0;
+	uint64_t runStart = regionEnd;
+	while (remaining > 0) {
+		const uint64_t readEnd = regionStart + remaining;
+		const size_t toRead = static_cast<size_t>(std::min<uint64_t>(chunkSize, remaining));
+		const uint64_t readStart = readEnd - toRead;
+		std::vector<unsigned char> buffer(toRead);
+		if (!dbg.readMemoryQuiet(readStart, buffer.data(), buffer.size())) {
+			break;
+		}
+		for (size_t idx = 0; idx < buffer.size(); ++idx) {
+			const size_t revIndex = buffer.size() - 1 - idx;
+			if (buffer[revIndex] == 0) {
+				runLen++;
+				runStart = readStart + revIndex;
+			} else {
+				remaining = 0;
+				break;
+			}
+		}
+		if (remaining != 0) {
+			remaining -= toRead;
+		}
+	}
+	if (runLen < minSize) {
+		return std::nullopt;
+	}
+	const uint64_t candidate = alignUp(runStart, alignment ? alignment : 1);
+	if (candidate + minSize > regionEnd) {
+		return std::nullopt;
+	}
+	return candidate;
 }
 
 struct HelperInlineState {
@@ -1409,7 +1598,9 @@ struct HelperInlineState {
 
 static bool setupHelperInlineHook(MuhDebugger &dbg,
                                   uint64_t helperSyscallAddr,
+                                  uint64_t runtimeBase,
                                   bool enableLogging,
+                                  bool minimalStub,
                                   HelperInlineState &state) {
 	mach_vm_address_t regionStart = 0;
 	mach_vm_size_t regionSize = 0;
@@ -1418,15 +1609,39 @@ static bool setupHelperInlineHook(MuhDebugger &dbg,
 		fprintf(stderr, "Failed to locate executable region for helper_syscall.\n");
 		return false;
 	}
-	const auto caveAddr = findZeroCaveInRegion(dbg, regionStart, regionSize, helperSyscallAddr, kHelperInlineStubSize, 8);
+	const char *runtimePath = "/usr/libexec/rosetta/runtime";
+	const auto trailingCave = findTrailingZeroCaveInRegion(dbg, regionStart, regionSize, kHelperInlineStubSize, 8);
+	std::optional<uint64_t> caveAddr;
+	if (trailingCave && runtimeBase != 0) {
+		const uint64_t fileOffset = *trailingCave - runtimeBase;
+		if (isFileRangeZero(runtimePath, fileOffset, kHelperInlineStubSize)) {
+			caveAddr = trailingCave;
+		}
+	}
+	if (!caveAddr) {
+		auto candidate = findZeroCaveInRegion(dbg, regionStart, regionSize, helperSyscallAddr, kHelperInlineStubSize, 8);
+		while (candidate && runtimeBase != 0) {
+			const uint64_t fileOffset = *candidate - runtimeBase;
+			if (isFileRangeZero(runtimePath, fileOffset, kHelperInlineStubSize)) {
+				caveAddr = candidate;
+				break;
+			}
+			const uint64_t nextStart = *candidate + 8;
+			candidate = findZeroCaveInRegion(dbg, regionStart, regionSize, nextStart, kHelperInlineStubSize, 8);
+		}
+		if (!caveAddr && candidate) {
+			caveAddr = candidate;
+		}
+	}
 	if (!caveAddr) {
 		fprintf(stderr, "Failed to locate executable code cave for inline helper hook.\n");
 		return false;
 	}
 	const uint64_t stubAddr = *caveAddr;
 
+	const bool useLogging = enableLogging && !minimalStub;
 	uint64_t bufferAddr = 0;
-	if (enableLogging) {
+	if (useLogging) {
 		const size_t bufferSize = kHelperInlineHeaderSize + kHelperInlineBufferSize;
 		if (!dbg.allocateMemory(bufferAddr, bufferSize, VM_PROT_READ | VM_PROT_WRITE)) {
 			fprintf(stderr, "Failed to allocate helper inline log buffer.\n");
@@ -1470,21 +1685,30 @@ static bool setupHelperInlineHook(MuhDebugger &dbg,
 	uint32_t relocated2 = 0;
 	uint32_t relocated3 = 0;
 	uint32_t relocated4 = 0;
-	if (!relocateInstruction(originalInstr0, helperSyscallAddr, stubAddr + kHelperInlineOrigOffset, relocated0) ||
-	    !relocateInstruction(originalInstr1, helperSyscallAddr + 4, stubAddr + kHelperInlineOrigOffset + 4, relocated1) ||
-	    !relocateInstruction(originalInstr2, helperSyscallAddr + 8, stubAddr + kHelperInlineOrigOffset + 8, relocated2) ||
-	    !relocateInstruction(originalInstr3, helperSyscallAddr + 12, stubAddr + kHelperInlineOrigOffset + 12, relocated3) ||
-	    !relocateInstruction(originalInstr4, helperSyscallAddr + 16, stubAddr + kHelperInlineOrigOffset + 16, relocated4)) {
+	const uint64_t relocateBase = minimalStub ? stubAddr : (stubAddr + kHelperInlineOrigOffset);
+	if (!relocateInstruction(originalInstr0, helperSyscallAddr, relocateBase, relocated0) ||
+	    !relocateInstruction(originalInstr1, helperSyscallAddr + 4, relocateBase + 4, relocated1) ||
+	    !relocateInstruction(originalInstr2, helperSyscallAddr + 8, relocateBase + 8, relocated2) ||
+	    !relocateInstruction(originalInstr3, helperSyscallAddr + 12, relocateBase + 12, relocated3) ||
+	    !relocateInstruction(originalInstr4, helperSyscallAddr + 16, relocateBase + 16, relocated4)) {
 		fprintf(stderr, "Failed to relocate helper_syscall prologue for inline hook.\n");
 		return false;
 	}
 
 	std::vector<uint8_t> stub;
-	const uint64_t literalValue = enableLogging ? bufferAddr : stubAddr;
-	if (!buildHelperInlineStub(relocated0, relocated1, relocated2, relocated3, relocated4,
-	                           stubAddr, helperSyscallAddr + 20, literalValue, enableLogging, stub)) {
-		fprintf(stderr, "Failed to build helper inline stub.\n");
-		return false;
+	if (minimalStub) {
+		if (!buildHelperInlineMinimalStub(relocated0, relocated1, relocated2, relocated3, relocated4,
+		                                  helperSyscallAddr + 20, stub)) {
+			fprintf(stderr, "Failed to build helper inline minimal stub.\n");
+			return false;
+		}
+	} else {
+		const uint64_t literalValue = useLogging ? bufferAddr : stubAddr;
+		if (!buildHelperInlineStub(relocated0, relocated1, relocated2, relocated3, relocated4,
+		                           stubAddr, helperSyscallAddr + 20, literalValue, useLogging, stub)) {
+			fprintf(stderr, "Failed to build helper inline stub.\n");
+			return false;
+		}
 	}
 
 	if (!dbg.adjustMemoryProtection(stubAddr, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, stub.size())) {
@@ -1501,12 +1725,8 @@ static bool setupHelperInlineHook(MuhDebugger &dbg,
 	}
 
 	const uint64_t targetAddr = stubAddr;
-	const uint32_t movz = encodeMovz(17, static_cast<uint16_t>(targetAddr & 0xffffu), 0);
-	const uint32_t movk1 = encodeMovk(17, static_cast<uint16_t>((targetAddr >> 16) & 0xffffu), 16);
-	const uint32_t movk2 = encodeMovk(17, static_cast<uint16_t>((targetAddr >> 32) & 0xffffu), 32);
-	const uint32_t movk3 = encodeMovk(17, static_cast<uint16_t>((targetAddr >> 48) & 0xffffu), 48);
-	const uint32_t brInstr = 0xD61F0220u; // br x17
-	const uint32_t patchInstrs[5] = {movz, movk1, movk2, movk3, brInstr};
+	uint32_t patchInstrs[5] = {};
+	encodeAbsoluteBranch(targetAddr, 17, patchInstrs);
 	if (!dbg.adjustMemoryProtection(helperSyscallAddr, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, sizeof(patchInstrs))) {
 		fprintf(stderr, "Failed to adjust protection for helper_syscall patch.\n");
 		return false;
@@ -1544,10 +1764,16 @@ int main(int argc, char *argv[]) {
 
 	logsEnabled = getenv("ASTROWINE_LOGS");
 	const std::string targetPath = argc > 1 ? argv[1] : "";
-	const bool passSigtrapBrk = getenv("ROSETTA_PASS_SIGTRAP") != nullptr;
-	const bool redirectSigsysBrk = getenv("ROSETTA_SKIP_SIGSYS_REDIRECT") == nullptr;
-	const bool skipWinebootHook = getenv("ROSETTA_SKIP_WINEBOOT") != nullptr;
+	const bool passSigtrapBrk = getenvPrefer("ASTROWINE_PASS_SIGTRAP", "ROSETTA_PASS_SIGTRAP") != nullptr;
+	bool redirectSigsysBrk = getenvPrefer("ASTROWINE_SKIP_SIGSYS_REDIRECT", "ROSETTA_SKIP_SIGSYS_REDIRECT") == nullptr;
+	const bool skipWinebootHook = getenvPrefer("ASTROWINE_SKIP_WINEBOOT", "ROSETTA_SKIP_WINEBOOT") != nullptr;
 	const bool inlineHelperHook = getenv("ASTROWINE_HELPER_INLINE") != nullptr;
+	const bool inlineMinimalStub = getenv("ASTROWINE_HELPER_INLINE_MINIMAL") != nullptr;
+	const bool detachAfterHook = getenv("ASTROWINE_DETACH") != nullptr;
+	const bool helperHooksEnabled = []() {
+		const char *env = getenv("ASTROWINE_HELPER_HOOKS");
+		return !(env && strcmp(env, "0") == 0);
+	}();
 	int inlinePollMs = 50;
 	if (const char *pollEnv = getenv("ASTROWINE_HELPER_INLINE_POLL_MS")) {
 		char *end = nullptr;
@@ -1556,12 +1782,12 @@ int main(int argc, char *argv[]) {
 			inlinePollMs = static_cast<int>(parsed);
 		}
 	}
-	const char *svcEnv = getenv("ROSETTA_SVC_HOOKS");
-	const bool svcHooksEnabled = !(svcEnv && strcmp(svcEnv, "0") == 0);
-	const bool svcScanAllExec = getenv("ROSETTA_SVC_SCAN_ALL_EXEC") != nullptr;
+	const char *svcEnv = getenvPrefer("ASTROWINE_SVC_HOOKS", "ROSETTA_SVC_HOOKS");
+	const bool svcHooksEnabled = svcEnv ? (strcmp(svcEnv, "0") != 0) : (!inlineHelperHook && helperHooksEnabled);
+	const bool svcScanAllExec = getenvPrefer("ASTROWINE_SVC_SCAN_ALL_EXEC", "ROSETTA_SVC_SCAN_ALL_EXEC") != nullptr;
 	uint64_t svcFilterValue = 0;
 	bool svcFilterEnabled = false;
-	if (const char *filterEnv = getenv("ROSETTA_SVC_FILTER_VALUE")) {
+	if (const char *filterEnv = getenvPrefer("ASTROWINE_SVC_FILTER_VALUE", "ROSETTA_SVC_FILTER_VALUE")) {
 		errno = 0;
 		char *end = nullptr;
 		const unsigned long long value = strtoull(filterEnv, &end, 0);
@@ -1571,7 +1797,7 @@ int main(int argc, char *argv[]) {
 		}
 	}
 	size_t svcScanInterval = 50;
-	if (const char *scanEnv = getenv("ROSETTA_SVC_SCAN_INTERVAL")) {
+	if (const char *scanEnv = getenvPrefer("ASTROWINE_SVC_SCAN_INTERVAL", "ROSETTA_SVC_SCAN_INTERVAL")) {
 		svcScanInterval = strtoull(scanEnv, nullptr, 10);
 	}
 	if (svcScanInterval == 0) {
@@ -1654,9 +1880,11 @@ int main(int argc, char *argv[]) {
 
 	bool helperInlineActive = false;
 	HelperInlineState helperInlineState;
+	if (helperHooksEnabled) {
 	if (inlineHelperHook) {
 		initHookLog();
-		if (!setupHelperInlineHook(dbg, helperSyscallAddr, hookLogsEnabled, helperInlineState)) {
+		const bool useMinimalStub = inlineMinimalStub;
+		if (!setupHelperInlineHook(dbg, helperSyscallAddr, runtimeBase, hookLogsEnabled, useMinimalStub, helperInlineState)) {
 			fprintf(stderr, "Inline helper hook failed; falling back to breakpoint hook.\n");
 		} else {
 			helperInlineActive = true;
@@ -1673,8 +1901,16 @@ int main(int argc, char *argv[]) {
 			return 1;
 		}
 	}
+}
+
+	if (detachAfterHook) {
+		redirectSigsysBrk = false;
+	}
 
 	{
+		const char *allowEnv = getenv("ASTROWINE_ALLOW_APPLE_INTERNAL");
+		const bool allowAppleInternal = !(allowEnv && strcmp(allowEnv, "0") == 0);
+		if (allowAppleInternal) {
 		const std::vector<uint8_t> allowPattern = {
 			0x70, 0x3C, 0x80, 0xD2, 0x01, 0x10, 0x00, 0xD4, 0x01, 0x00,
 			0x80, 0x92, 0x20, 0x20, 0x80, 0x9A, 0xC0, 0x03, 0x5F, 0xD6
@@ -1695,6 +1931,23 @@ int main(int argc, char *argv[]) {
 		} else {
 			hookLog("[allow_apple_internal] pattern not found in /usr/libexec/rosetta/runtime\n");
 		}
+		}
+	}
+
+	bool shouldDetach = detachAfterHook;
+	if (!shouldDetach) {
+		if (helperInlineActive && !hookLogsEnabled && !svcHooksEnabled) {
+			shouldDetach = true;
+		} else if (!helperHooksEnabled && !svcHooksEnabled && !hookLogsEnabled) {
+			shouldDetach = true;
+		}
+	}
+	if (shouldDetach && !svcHooksEnabled && !hookLogsEnabled && (helperInlineActive || !helperHooksEnabled)) {
+		if (!dbg.detach()) {
+			fprintf(stderr, "Failed to detach debugger\n");
+			return 1;
+		}
+		return 0;
 	}
 
 	std::atomic<bool> inlineLogRunning{false};
