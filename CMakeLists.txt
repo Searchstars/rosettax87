@@ -74,11 +74,11 @@ target_compile_options(libRuntimeRosettax87 PRIVATE
     "-flto"
 )
 
-set(HELPER_INLINE_C_OBJ "${CMAKE_BINARY_DIR}/helper_syscall_inline_c.o")
+set(HELPER_INLINE_C_OBJ "${CMAKE_BINARY_DIR}/rosetta_inline_payload.o")
 
 add_custom_command(
     OUTPUT "${HELPER_INLINE_C_OBJ}"
-    COMMAND "${CMAKE_C_COMPILER}" -c "${CMAKE_SOURCE_DIR}/payload/helper_syscall_inline_c.c"
+    COMMAND "${CMAKE_C_COMPILER}" -c "${CMAKE_SOURCE_DIR}/payload/rosetta_inline_payload.c"
             -o "${HELPER_INLINE_C_OBJ}"
             -arch arm64
             -O2
@@ -98,8 +98,8 @@ add_custom_command(
             -ffixed-x14
             -ffixed-x15
             -ffixed-x18
-    DEPENDS "${CMAKE_SOURCE_DIR}/payload/helper_syscall_inline_c.c"
-    COMMENT "Building helper_syscall inline C blob"
+    DEPENDS "${CMAKE_SOURCE_DIR}/payload/rosetta_inline_payload.c"
+    COMMENT "Building inline payload C blob"
 )
 
 add_custom_target(helper_inline_c_blob DEPENDS "${HELPER_INLINE_C_OBJ}")

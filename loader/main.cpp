@@ -134,12 +134,17 @@ static bool readFileAt(const char *path, uint64_t offset, void *buffer, size_t s
 	return bytes == static_cast<ssize_t>(size);
 }
 
-static bool readMachOTextSectionWithSymbol(const char *path,
-                                           const char *symbolName,
-                                           std::vector<uint8_t> &out,
-                                           uint64_t &symbolOffset) {
-	symbolOffset = 0;
-	if (!path || !symbolName) {
+static bool readMachOTextSectionWithSymbols(const char *path,
+                                            const char *symbolA,
+                                            uint64_t &offsetA,
+                                            const char *symbolB,
+                                            uint64_t &offsetB,
+                                            std::vector<uint8_t> &out) {
+	bool foundA = false;
+	bool foundB = false;
+	offsetA = 0;
+	offsetB = 0;
+	if (!path || !symbolA || !symbolB) {
 		return false;
 	}
 	struct stat st {};
@@ -226,15 +231,32 @@ static bool readMachOTextSectionWithSymbol(const char *path,
 			continue;
 		}
 		const char *name = strings.data() + sym.n_un.n_strx;
-		if (strcmp(name, symbolName) == 0) {
+		if (strcmp(name, symbolA) == 0) {
 			if (sym.n_value < textAddr) {
 				return false;
 			}
-			symbolOffset = sym.n_value - textAddr;
-			if (symbolOffset >= textSize) {
+			offsetA = sym.n_value - textAddr;
+			if (offsetA >= textSize) {
 				return false;
 			}
-			return true;
+			foundA = true;
+			if (foundB) {
+				return true;
+			}
+			continue;
+		}
+		if (strcmp(name, symbolB) == 0) {
+			if (sym.n_value < textAddr) {
+				return false;
+			}
+			offsetB = sym.n_value - textAddr;
+			if (offsetB >= textSize) {
+				return false;
+			}
+			foundB = true;
+			if (foundA) {
+				return true;
+			}
 		}
 	}
 	return false;
@@ -539,6 +561,7 @@ static bool buildHelperInlineDirectFormatStub(uint32_t originalInstr0,
                                               uint64_t returnAddr,
                                               const std::vector<uint8_t> &formatterBlob,
                                               uint64_t formatterEntryOffset,
+                                              bool useSvcArg,
                                               std::vector<uint8_t> &outStub) {
 	if (formatterBlob.empty()) {
 		return false;
@@ -560,11 +583,19 @@ static bool buildHelperInlineDirectFormatStub(uint32_t originalInstr0,
 	instrs.push_back(encodeStrImm(30, 31, 0x58));
 
 	instrs.push_back(encodeAddImm(0, 31, kHelperInlineDirectFormatBufferOffset)); // x0 = buffer
-	instrs.push_back(encodeLdrImm(1, 31, 0x48));                                   // x1 = saved x16 (svc)
-	instrs.push_back(encodeLdrImm(2, 31, 0x00));                                   // x2 = saved x0
-	instrs.push_back(encodeLdrImm(3, 31, 0x08));                                   // x3 = saved x1
-	instrs.push_back(encodeLdrImm(4, 31, 0x10));                                   // x4 = saved x2
-	instrs.push_back(encodeLdrImm(5, 31, 0x18));                                   // x5 = saved x3
+	if (useSvcArg) {
+		instrs.push_back(encodeLdrImm(1, 31, 0x48)); // x1 = saved x16 (svc)
+		instrs.push_back(encodeLdrImm(2, 31, 0x00)); // x2 = saved x0
+		instrs.push_back(encodeLdrImm(3, 31, 0x08)); // x3 = saved x1
+		instrs.push_back(encodeLdrImm(4, 31, 0x10)); // x4 = saved x2
+		instrs.push_back(encodeLdrImm(5, 31, 0x18)); // x5 = saved x3
+	} else {
+		instrs.push_back(encodeLdrImm(1, 31, 0x00)); // x1 = saved x0
+		instrs.push_back(encodeLdrImm(2, 31, 0x08)); // x2 = saved x1
+		instrs.push_back(encodeLdrImm(3, 31, 0x10)); // x3 = saved x2
+		instrs.push_back(encodeLdrImm(4, 31, 0x18)); // x4 = saved x3
+		instrs.push_back(encodeLdrImm(5, 31, 0x20)); // x5 = saved x4
+	}
 
 	const size_t bodySize = kHelperInlineDirectFormatBodySize;
 	const size_t blobOffset = alignUp(bodySize, 4);
@@ -978,23 +1009,26 @@ static std::optional<uint64_t> findTrailingZeroCaveInRegion(MuhDebugger &dbg,
 }
 
 static bool setupHelperInlineHook(MuhDebugger &dbg,
-                                  uint64_t helperSyscallAddr,
+                                  uint64_t helperAddr,
                                   uint64_t runtimeBase,
                                   const std::vector<uint8_t> &formatBlob,
-                                  uint64_t formatEntryOffset) {
+                                  uint64_t formatEntryOffset,
+                                  bool useSvcArg,
+                                  const char *label) {
+	const char *tag = label ? label : "helper";
 	mach_vm_address_t regionStart = 0;
 	mach_vm_size_t regionSize = 0;
 	vm_prot_t regionProt = 0;
-	if (!findExecRegionForAddress(dbg, helperSyscallAddr, regionStart, regionSize, regionProt)) {
-		fprintf(stderr, "Failed to locate executable region for helper_syscall.\n");
+	if (!findExecRegionForAddress(dbg, helperAddr, regionStart, regionSize, regionProt)) {
+		fprintf(stderr, "%s: Failed to locate executable region for helper entry.\n", tag);
 		return false;
 	}
 	if (formatBlob.empty()) {
-		fprintf(stderr, "Inline formatter blob is empty.\n");
+		fprintf(stderr, "%s: Inline formatter blob is empty.\n", tag);
 		return false;
 	}
 	if (formatEntryOffset >= formatBlob.size()) {
-		fprintf(stderr, "Inline formatter entry offset is out of range.\n");
+		fprintf(stderr, "%s: Inline formatter entry offset is out of range.\n", tag);
 		return false;
 	}
 	const char *runtimePath = "/usr/libexec/rosetta/runtime";
@@ -1008,7 +1042,7 @@ static bool setupHelperInlineHook(MuhDebugger &dbg,
 		}
 	}
 	if (!caveAddr) {
-		auto candidate = findZeroCaveInRegion(dbg, regionStart, regionSize, helperSyscallAddr, stubSize, 8);
+		auto candidate = findZeroCaveInRegion(dbg, regionStart, regionSize, helperAddr, stubSize, 8);
 		while (candidate && runtimeBase != 0) {
 			const uint64_t fileOffset = *candidate - runtimeBase;
 			if (isFileRangeZero(runtimePath, fileOffset, stubSize)) {
@@ -1023,7 +1057,7 @@ static bool setupHelperInlineHook(MuhDebugger &dbg,
 		}
 	}
 	if (!caveAddr) {
-		fprintf(stderr, "Failed to locate executable code cave for inline helper hook.\n");
+		fprintf(stderr, "%s: Failed to locate executable code cave for inline helper hook.\n", tag);
 		return false;
 	}
 	const uint64_t stubAddr = *caveAddr;
@@ -1033,24 +1067,24 @@ static bool setupHelperInlineHook(MuhDebugger &dbg,
 	uint32_t originalInstr2 = 0;
 	uint32_t originalInstr3 = 0;
 	uint32_t originalInstr4 = 0;
-	if (!dbg.readMemory(helperSyscallAddr, &originalInstr0, sizeof(originalInstr0))) {
-		fprintf(stderr, "Failed to read helper_syscall prologue for inline hook.\n");
+	if (!dbg.readMemory(helperAddr, &originalInstr0, sizeof(originalInstr0))) {
+		fprintf(stderr, "%s: Failed to read helper prologue for inline hook.\n", tag);
 		return false;
 	}
-	if (!dbg.readMemory(helperSyscallAddr + sizeof(uint32_t), &originalInstr1, sizeof(originalInstr1))) {
-		fprintf(stderr, "Failed to read helper_syscall prologue for inline hook.\n");
+	if (!dbg.readMemory(helperAddr + sizeof(uint32_t), &originalInstr1, sizeof(originalInstr1))) {
+		fprintf(stderr, "%s: Failed to read helper prologue for inline hook.\n", tag);
 		return false;
 	}
-	if (!dbg.readMemory(helperSyscallAddr + 2 * sizeof(uint32_t), &originalInstr2, sizeof(originalInstr2))) {
-		fprintf(stderr, "Failed to read helper_syscall prologue for inline hook.\n");
+	if (!dbg.readMemory(helperAddr + 2 * sizeof(uint32_t), &originalInstr2, sizeof(originalInstr2))) {
+		fprintf(stderr, "%s: Failed to read helper prologue for inline hook.\n", tag);
 		return false;
 	}
-	if (!dbg.readMemory(helperSyscallAddr + 3 * sizeof(uint32_t), &originalInstr3, sizeof(originalInstr3))) {
-		fprintf(stderr, "Failed to read helper_syscall prologue for inline hook.\n");
+	if (!dbg.readMemory(helperAddr + 3 * sizeof(uint32_t), &originalInstr3, sizeof(originalInstr3))) {
+		fprintf(stderr, "%s: Failed to read helper prologue for inline hook.\n", tag);
 		return false;
 	}
-	if (!dbg.readMemory(helperSyscallAddr + 4 * sizeof(uint32_t), &originalInstr4, sizeof(originalInstr4))) {
-		fprintf(stderr, "Failed to read helper_syscall prologue for inline hook.\n");
+	if (!dbg.readMemory(helperAddr + 4 * sizeof(uint32_t), &originalInstr4, sizeof(originalInstr4))) {
+		fprintf(stderr, "%s: Failed to read helper prologue for inline hook.\n", tag);
 		return false;
 	}
 
@@ -1060,53 +1094,53 @@ static bool setupHelperInlineHook(MuhDebugger &dbg,
 	uint32_t relocated3 = 0;
 	uint32_t relocated4 = 0;
 	const uint64_t relocateBase = stubAddr + kHelperInlineDirectFormatOrigOffset;
-	if (!relocateInstruction(originalInstr0, helperSyscallAddr, relocateBase, relocated0) ||
-	    !relocateInstruction(originalInstr1, helperSyscallAddr + 4, relocateBase + 4, relocated1) ||
-	    !relocateInstruction(originalInstr2, helperSyscallAddr + 8, relocateBase + 8, relocated2) ||
-	    !relocateInstruction(originalInstr3, helperSyscallAddr + 12, relocateBase + 12, relocated3) ||
-	    !relocateInstruction(originalInstr4, helperSyscallAddr + 16, relocateBase + 16, relocated4)) {
-		fprintf(stderr, "Failed to relocate helper_syscall prologue for inline hook.\n");
+	if (!relocateInstruction(originalInstr0, helperAddr, relocateBase, relocated0) ||
+	    !relocateInstruction(originalInstr1, helperAddr + 4, relocateBase + 4, relocated1) ||
+	    !relocateInstruction(originalInstr2, helperAddr + 8, relocateBase + 8, relocated2) ||
+	    !relocateInstruction(originalInstr3, helperAddr + 12, relocateBase + 12, relocated3) ||
+	    !relocateInstruction(originalInstr4, helperAddr + 16, relocateBase + 16, relocated4)) {
+		fprintf(stderr, "%s: Failed to relocate helper prologue for inline hook.\n", tag);
 		return false;
 	}
 
 	std::vector<uint8_t> stub;
 	if (!buildHelperInlineDirectFormatStub(relocated0, relocated1, relocated2, relocated3, relocated4,
-	                                       stubAddr, helperSyscallAddr + 20, formatBlob, formatEntryOffset, stub)) {
-		fprintf(stderr, "Failed to build helper inline formatted stub.\n");
+	                                       stubAddr, helperAddr + 20, formatBlob, formatEntryOffset, useSvcArg, stub)) {
+		fprintf(stderr, "%s: Failed to build helper inline formatted stub.\n", tag);
 		return false;
 	}
 
 	if (!dbg.adjustMemoryProtection(stubAddr, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, stub.size())) {
-		fprintf(stderr, "Failed to adjust protection for helper inline stub.\n");
+		fprintf(stderr, "%s: Failed to adjust protection for helper inline stub.\n", tag);
 		return false;
 	}
 	if (!dbg.writeMemory(stubAddr, stub.data(), stub.size())) {
-		fprintf(stderr, "Failed to write helper inline stub.\n");
+		fprintf(stderr, "%s: Failed to write helper inline stub.\n", tag);
 		return false;
 	}
 	(void)dbg.flushInstructionCache(stubAddr, stub.size());
 	if (!dbg.adjustMemoryProtection(stubAddr, VM_PROT_READ | VM_PROT_EXECUTE, stub.size())) {
-		fprintf(stderr, "Failed to restore protection for helper inline stub.\n");
+		fprintf(stderr, "%s: Failed to restore protection for helper inline stub.\n", tag);
 		return false;
 	}
 
 	uint32_t patchInstrs[5] = {};
 	encodeAbsoluteBranch(stubAddr, 17, patchInstrs);
-	if (!dbg.adjustMemoryProtection(helperSyscallAddr, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, sizeof(patchInstrs))) {
-		fprintf(stderr, "Failed to adjust protection for helper_syscall patch.\n");
+	if (!dbg.adjustMemoryProtection(helperAddr, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, sizeof(patchInstrs))) {
+		fprintf(stderr, "%s: Failed to adjust protection for helper patch.\n", tag);
 		return false;
 	}
-	if (!dbg.writeMemory(helperSyscallAddr, patchInstrs, sizeof(patchInstrs))) {
-		fprintf(stderr, "Failed to patch helper_syscall entry for inline hook.\n");
+	if (!dbg.writeMemory(helperAddr, patchInstrs, sizeof(patchInstrs))) {
+		fprintf(stderr, "%s: Failed to patch helper entry for inline hook.\n", tag);
 		return false;
 	}
-	(void)dbg.flushInstructionCache(helperSyscallAddr, sizeof(patchInstrs));
-	if (!dbg.adjustMemoryProtection(helperSyscallAddr, VM_PROT_READ | VM_PROT_EXECUTE, sizeof(patchInstrs))) {
-		fprintf(stderr, "Failed to restore protection for helper_syscall patch.\n");
+	(void)dbg.flushInstructionCache(helperAddr, sizeof(patchInstrs));
+	if (!dbg.adjustMemoryProtection(helperAddr, VM_PROT_READ | VM_PROT_EXECUTE, sizeof(patchInstrs))) {
+		fprintf(stderr, "%s: Failed to restore protection for helper patch.\n", tag);
 		return false;
 	}
 
-	hookLog("helper_inline stub at 0x%llx\n", static_cast<unsigned long long>(stubAddr));
+	hookLog("%s inline stub at 0x%llx\n", tag, static_cast<unsigned long long>(stubAddr));
 	return true;
 }
 
@@ -1155,6 +1189,12 @@ int main(int argc, char *argv[]) {
 	}
 	LOG("Found rosetta runtime helper offsets successfully!\n");
 	LOG("offset_helper_syscall=%llx\n", offsetFinder.offsetHelperSyscall_);
+	LOG("offset_helper_resolve=%llx\n", offsetFinder.offsetHelperResolveAddr_);
+	if (offsetFinder.offsetHelperResolveAddr_ == 0) {
+		fprintf(stderr, "Failed to locate helper_resolve pattern in Rosetta runtime.\n");
+		dbg.detach();
+		return 1;
+	}
 
 	uint64_t runtimeBase = dbg.findRuntime();
 	uint64_t helperSyscallAddr = 0;
@@ -1178,29 +1218,42 @@ int main(int argc, char *argv[]) {
 	}
 
 	LOG("helper_syscall address: 0x%llx\n", helperSyscallAddr);
+	const uint64_t helperResolveAddr = runtimeBase + offsetFinder.offsetHelperResolveAddr_;
+	LOG("helper_resolve address: 0x%llx\n", static_cast<unsigned long long>(helperResolveAddr));
 
 	std::string blobPath;
 	if (inlineCPathEnv && *inlineCPathEnv) {
 		blobPath = inlineCPathEnv;
 	} else {
 		blobPath = dirName(argv[0]);
-		blobPath += "/helper_syscall_inline_c.o";
+		blobPath += "/rosetta_inline_payload.o";
 	}
 
 	std::vector<uint8_t> inlineFormatBlob;
-	uint64_t inlineFormatEntryOffset = 0;
-	if (!readMachOTextSectionWithSymbol(blobPath.c_str(), "_rosetta_helper_syscall_inline",
-	                                    inlineFormatBlob, inlineFormatEntryOffset)) {
+	uint64_t inlineSyscallOffset = 0;
+	uint64_t inlineResolveOffset = 0;
+	if (!readMachOTextSectionWithSymbols(blobPath.c_str(),
+	                                     "_rosetta_helper_syscall_inline",
+	                                     inlineSyscallOffset,
+	                                     "_rosetta_helper_resolve_inline",
+	                                     inlineResolveOffset,
+	                                     inlineFormatBlob)) {
 		fprintf(stderr, "Failed to load inline helper C text from %s\n", blobPath.c_str());
 		dbg.detach();
 		return 1;
 	}
-	LOG("inline_c blob loaded from %s (%zu bytes, entry 0x%llx)\n",
+	LOG("inline_c blob loaded from %s (%zu bytes, syscall 0x%llx resolve 0x%llx)\n",
 	    blobPath.c_str(), inlineFormatBlob.size(),
-	    static_cast<unsigned long long>(inlineFormatEntryOffset));
+	    static_cast<unsigned long long>(inlineSyscallOffset),
+	    static_cast<unsigned long long>(inlineResolveOffset));
 
-	if (!setupHelperInlineHook(dbg, helperSyscallAddr, runtimeBase, inlineFormatBlob, inlineFormatEntryOffset)) {
-		fprintf(stderr, "Inline helper hook failed.\n");
+	if (!setupHelperInlineHook(dbg, helperSyscallAddr, runtimeBase, inlineFormatBlob, inlineSyscallOffset, true, "helper_syscall")) {
+		fprintf(stderr, "Inline helper_syscall hook failed.\n");
+		dbg.detach();
+		return 1;
+	}
+	if (!setupHelperInlineHook(dbg, helperResolveAddr, runtimeBase, inlineFormatBlob, inlineResolveOffset, false, "helper_resolve")) {
+		fprintf(stderr, "Inline helper_resolve hook failed.\n");
 		dbg.detach();
 		return 1;
 	}
