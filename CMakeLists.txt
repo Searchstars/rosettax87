@@ -5,7 +5,7 @@ project(rosettax87)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_executable(rosettax87 loader/main.cpp loader/macho_loader.cpp loader/offset_finder.cpp)
+add_executable(rosettax87 loader/main.cpp loader/offset_finder.cpp)
 
 # We need to sign the binary with those entitlements to allow debugging without root
 set(ENTITLEMENTS_FILE "${CMAKE_SOURCE_DIR}/entitlements.plist")
@@ -72,28 +72,6 @@ target_link_options(libRuntimeRosettax87 PRIVATE
 target_compile_options(libRuntimeRosettax87 PRIVATE
     ${OPTIMIZATION_FLAGS}
     "-flto"
-)
-
-add_library(rosetta_helper_hook MODULE
-    payload/rosetta_helper_hook.c
-)
-
-target_compile_options(rosetta_helper_hook PRIVATE
-    "-fvisibility=hidden"
-    "-fno-stack-protector"
-    "-ffixed-x9"
-    "-ffixed-x10"
-    "-ffixed-x11"
-    "-ffixed-x12"
-    "-ffixed-x13"
-    "-ffixed-x14"
-    "-ffixed-x15"
-    "-ffixed-x18"
-)
-
-target_link_options(rosetta_helper_hook PRIVATE
-    "-Wl,-undefined,dynamic_lookup"
-    "-Wl,-bind_at_load"
 )
 
 set(HELPER_INLINE_C_OBJ "${CMAKE_BINARY_DIR}/helper_syscall_inline_c.o")

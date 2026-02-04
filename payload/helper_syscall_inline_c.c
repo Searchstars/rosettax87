@@ -20,6 +20,24 @@ uint64_t rosetta_helper_syscall_inline(char *out,
                                        uint64_t x2,
                                        uint64_t x3) {
 	char *cursor = out;
+	*cursor++ = '[';
+	*cursor++ = 'h';
+	*cursor++ = 'e';
+	*cursor++ = 'l';
+	*cursor++ = 'p';
+	*cursor++ = 'e';
+	*cursor++ = 'r';
+	*cursor++ = '_';
+	*cursor++ = 's';
+	*cursor++ = 'y';
+	*cursor++ = 's';
+	*cursor++ = 'c';
+	*cursor++ = 'a';
+	*cursor++ = 'l';
+	*cursor++ = 'l';
+	*cursor++ = ']';
+	*cursor++ = ' ';
+
 	*cursor++ = 's';
 	*cursor++ = 'v';
 	*cursor++ = 'c';
