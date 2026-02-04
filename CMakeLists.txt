@@ -73,3 +73,56 @@ target_compile_options(libRuntimeRosettax87 PRIVATE
     ${OPTIMIZATION_FLAGS}
     "-flto"
 )
+
+add_library(rosetta_helper_hook MODULE
+    payload/rosetta_helper_hook.c
+)
+
+target_compile_options(rosetta_helper_hook PRIVATE
+    "-fvisibility=hidden"
+    "-fno-stack-protector"
+    "-ffixed-x9"
+    "-ffixed-x10"
+    "-ffixed-x11"
+    "-ffixed-x12"
+    "-ffixed-x13"
+    "-ffixed-x14"
+    "-ffixed-x15"
+    "-ffixed-x18"
+)
+
+target_link_options(rosetta_helper_hook PRIVATE
+    "-Wl,-undefined,dynamic_lookup"
+    "-Wl,-bind_at_load"
+)
+
+set(HELPER_INLINE_C_OBJ "${CMAKE_BINARY_DIR}/helper_syscall_inline_c.o")
+
+add_custom_command(
+    OUTPUT "${HELPER_INLINE_C_OBJ}"
+    COMMAND "${CMAKE_C_COMPILER}" -c "${CMAKE_SOURCE_DIR}/payload/helper_syscall_inline_c.c"
+            -o "${HELPER_INLINE_C_OBJ}"
+            -arch arm64
+            -O2
+            -ffreestanding
+            -fno-builtin
+            -fno-stack-protector
+            -fno-asynchronous-unwind-tables
+            -fno-unwind-tables
+            -fno-exceptions
+            -fno-vectorize
+            -fno-slp-vectorize
+            -ffixed-x9
+            -ffixed-x10
+            -ffixed-x11
+            -ffixed-x12
+            -ffixed-x13
+            -ffixed-x14
+            -ffixed-x15
+            -ffixed-x18
+    DEPENDS "${CMAKE_SOURCE_DIR}/payload/helper_syscall_inline_c.c"
+    COMMENT "Building helper_syscall inline C blob"
+)
+
+add_custom_target(helper_inline_c_blob DEPENDS "${HELPER_INLINE_C_OBJ}")
+add_dependencies(rosettax87 helper_inline_c_blob)
