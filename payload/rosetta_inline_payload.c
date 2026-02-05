@@ -275,7 +275,17 @@ uint64_t rosetta_helper_resolve_inline(char *scratch,
 	uint64_t *list = rosetta_inline_list(state);
 	rosetta_inline_list_insert(state, list, ret_addr);
 	rosetta_inline_map_insert(state, map, ret_addr, x86_addr);
+	const uint64_t map_count = state->map_count;
+	const uint64_t list_count = state->list_count;
 	rosetta_inline_spin_unlock(&state->lock);
+
+	rosetta_wine_control *wine = rosetta_wine_ctrl();
+	if (wine) {
+		__atomic_store_n(&wine->map_write_count, map_count, __ATOMIC_RELAXED);
+		__atomic_store_n(&wine->list_write_count, list_count, __ATOMIC_RELAXED);
+		__atomic_store_n(&wine->last_x86_addr, x86_addr, __ATOMIC_RELAXED);
+		__atomic_store_n(&wine->last_arm_pc, ret_addr, __ATOMIC_RELAXED);
+	}
 	return ret_addr;
 }
 
