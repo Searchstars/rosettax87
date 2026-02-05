@@ -21,11 +21,14 @@
 #include <mach/vm_attributes.h>
 #include <sys/stat.h>
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "offset_finder.hpp"
+#include "../payload/rosetta_inline_shared.h"
 
 typedef const struct dyld_process_info_base *DyldProcessInfo;
 extern "C" DyldProcessInfo _dyld_process_info_create(task_t task, uint64_t timestamp, kern_return_t *kernelError);
@@ -37,6 +40,12 @@ static bool hookLogsEnabled = true;
 static bool hookLogInitialized = false;
 static int hookLogFd = -1;
 static int hookLogSinkFd = STDERR_FILENO;
+constexpr uint64_t kInlineMapCapacity = 1ull << 18;
+constexpr uint64_t kInlineListCapacity = 1ull << 18;
+constexpr uint64_t kWineCtrlScanMaxBytesDefault = 2048ull << 20;
+constexpr uint64_t kWineCtrlScanMaxMillisDefault = 6000;
+constexpr uint64_t kWineCtrlScanDelayMillisDefault = 200;
+constexpr uint64_t kWineCtrlScanRetryCountDefault = 0;
 
 static void initHookLog() {
 	if (hookLogInitialized) {
@@ -132,6 +141,19 @@ static bool readFileAt(const char *path, uint64_t offset, void *buffer, size_t s
 	const ssize_t bytes = pread(fd, buffer, size, static_cast<off_t>(offset));
 	close(fd);
 	return bytes == static_cast<ssize_t>(size);
+}
+
+static uint64_t parseEnvU64(const char *name, uint64_t fallback) {
+	const char *value = getenv(name);
+	if (!value || !*value) {
+		return fallback;
+	}
+	char *end = nullptr;
+	const unsigned long long parsed = strtoull(value, &end, 0);
+	if (end == value) {
+		return fallback;
+	}
+	return static_cast<uint64_t>(parsed);
 }
 
 static bool readMachOTextSectionWithSymbols(const char *path,
@@ -392,6 +414,10 @@ static uint32_t encodeBlr(uint8_t reg) {
 	return 0xD63F0000u | (static_cast<uint32_t>(reg & 0x1fu) << 5);
 }
 
+static uint32_t encodeRet() {
+	return 0xD65F03C0u;
+}
+
 static void encodeAbsoluteBranch(uint64_t target, uint8_t reg, uint32_t outInstrs[5]) {
 	outInstrs[0] = encodeMovz(reg, static_cast<uint16_t>(target & 0xffffu), 0);
 	outInstrs[1] = encodeMovk(reg, static_cast<uint16_t>((target >> 16) & 0xffffu), 16);
@@ -542,8 +568,11 @@ static bool relocateInstruction(uint32_t instr, uint64_t origAddr, uint64_t newA
 constexpr size_t kHelperInlineDirectFormatFrameSize = 0x160;
 constexpr size_t kHelperInlineDirectFormatBufferOffset = 0x60;
 constexpr size_t kHelperInlineDirectFormatBufferSize = 0x100;
-constexpr size_t kHelperInlineDirectFormatOrigOffset = 0x6C;
+constexpr size_t kHelperInlineDirectFormatOrigOffset = 0x74;
 constexpr size_t kHelperInlineDirectFormatBodySize = kHelperInlineDirectFormatOrigOffset + 40;
+constexpr size_t kHelperInlineWrapperRetOffset = 0x60;
+constexpr size_t kHelperInlineWrapperBodySize = 0x94;
+constexpr size_t kHelperInlineWrapperTrampSize = 40;
 
 static void fillNops(std::vector<uint8_t> &buffer) {
 	static const uint8_t nop[4] = {0x1F, 0x20, 0x03, 0xD5};
@@ -561,7 +590,6 @@ static bool buildHelperInlineDirectFormatStub(uint32_t originalInstr0,
                                               uint64_t returnAddr,
                                               const std::vector<uint8_t> &formatterBlob,
                                               uint64_t formatterEntryOffset,
-                                              bool useSvcArg,
                                               std::vector<uint8_t> &outStub) {
 	if (formatterBlob.empty()) {
 		return false;
@@ -583,19 +611,13 @@ static bool buildHelperInlineDirectFormatStub(uint32_t originalInstr0,
 	instrs.push_back(encodeStrImm(30, 31, 0x58));
 
 	instrs.push_back(encodeAddImm(0, 31, kHelperInlineDirectFormatBufferOffset)); // x0 = buffer
-	if (useSvcArg) {
-		instrs.push_back(encodeLdrImm(1, 31, 0x48)); // x1 = saved x16 (svc)
-		instrs.push_back(encodeLdrImm(2, 31, 0x00)); // x2 = saved x0
-		instrs.push_back(encodeLdrImm(3, 31, 0x08)); // x3 = saved x1
-		instrs.push_back(encodeLdrImm(4, 31, 0x10)); // x4 = saved x2
-		instrs.push_back(encodeLdrImm(5, 31, 0x18)); // x5 = saved x3
-	} else {
-		instrs.push_back(encodeLdrImm(1, 31, 0x00)); // x1 = saved x0
-		instrs.push_back(encodeLdrImm(2, 31, 0x08)); // x2 = saved x1
-		instrs.push_back(encodeLdrImm(3, 31, 0x10)); // x3 = saved x2
-		instrs.push_back(encodeLdrImm(4, 31, 0x18)); // x4 = saved x3
-		instrs.push_back(encodeLdrImm(5, 31, 0x20)); // x5 = saved x4
-	}
+	instrs.push_back(encodeLdrImm(1, 31, 0x00)); // x1 = saved x0
+	instrs.push_back(encodeLdrImm(2, 31, 0x08)); // x2 = saved x1
+	instrs.push_back(encodeLdrImm(3, 31, 0x10)); // x3 = saved x2
+	instrs.push_back(encodeLdrImm(4, 31, 0x18)); // x4 = saved x3
+	instrs.push_back(encodeLdrImm(5, 31, 0x20)); // x5 = saved x4
+	instrs.push_back(encodeLdrImm(6, 31, 0x28)); // x6 = saved x5
+	instrs.push_back(encodeLdrImm(7, 31, 0x58)); // x7 = saved x30 (return address)
 
 	const size_t bodySize = kHelperInlineDirectFormatBodySize;
 	const size_t blobOffset = alignUp(bodySize, 4);
@@ -643,6 +665,118 @@ static bool buildHelperInlineDirectFormatStub(uint32_t originalInstr0,
 	outStub.assign(totalSize, 0);
 	fillNops(outStub);
 	memcpy(outStub.data(), instrs.data(), byteCount);
+	memcpy(outStub.data() + blobOffset, formatterBlob.data(), formatterBlob.size());
+	return true;
+}
+
+static void patchMovSequence(std::vector<uint32_t> &instrs, size_t index, int reg, uint64_t value) {
+	instrs[index + 0] = encodeMovz(reg, static_cast<uint16_t>(value & 0xffffu), 0);
+	instrs[index + 1] = encodeMovk(reg, static_cast<uint16_t>((value >> 16) & 0xffffu), 16);
+	instrs[index + 2] = encodeMovk(reg, static_cast<uint16_t>((value >> 32) & 0xffffu), 32);
+	instrs[index + 3] = encodeMovk(reg, static_cast<uint16_t>((value >> 48) & 0xffffu), 48);
+}
+
+static bool buildHelperInlineWrapperStub(uint32_t originalInstr0,
+                                         uint32_t originalInstr1,
+                                         uint32_t originalInstr2,
+                                         uint32_t originalInstr3,
+                                         uint32_t originalInstr4,
+                                         uint64_t stubAddr,
+                                         uint64_t returnAddr,
+                                         const std::vector<uint8_t> &formatterBlob,
+                                         uint64_t formatterEntryOffset,
+                                         std::vector<uint8_t> &outStub) {
+	if (formatterBlob.empty()) {
+		return false;
+	}
+	if (formatterEntryOffset >= formatterBlob.size()) {
+		return false;
+	}
+
+	std::vector<uint32_t> instrs;
+	instrs.reserve(96);
+
+	// Save volatile regs + output scratch.
+	instrs.push_back(encodeSubImm(31, 31, kHelperInlineDirectFormatFrameSize));
+	instrs.push_back(encodeStpImm(0, 1, 31, 0x00));
+	instrs.push_back(encodeStpImm(2, 3, 31, 0x10));
+	instrs.push_back(encodeStpImm(4, 5, 31, 0x20));
+	instrs.push_back(encodeStpImm(6, 7, 31, 0x30));
+	instrs.push_back(encodeStrImm(8, 31, 0x40));
+	instrs.push_back(encodeStpImm(16, 17, 31, 0x48));
+	instrs.push_back(encodeStrImm(30, 31, 0x58));
+
+	// Call trampoline (original function).
+	const size_t trampMovIndex = instrs.size();
+	instrs.push_back(encodeMovz(16, 0, 0));
+	instrs.push_back(encodeMovk(16, 0, 16));
+	instrs.push_back(encodeMovk(16, 0, 32));
+	instrs.push_back(encodeMovk(16, 0, 48));
+	instrs.push_back(encodeBlr(16));
+
+	// Save return value.
+	instrs.push_back(encodeStrImm(0, 31, kHelperInlineWrapperRetOffset));
+
+	// Prepare args for inline payload.
+	instrs.push_back(encodeAddImm(0, 31, kHelperInlineWrapperRetOffset)); // x0 = scratch
+	instrs.push_back(encodeLdrImm(1, 31, 0x00));                          // x1 = saved x0
+	instrs.push_back(encodeLdrImm(2, 31, 0x08));                          // x2 = saved x1
+	instrs.push_back(encodeLdrImm(3, 31, 0x10));                          // x3 = saved x2
+	instrs.push_back(encodeLdrImm(4, 31, 0x18));                          // x4 = saved x3
+	instrs.push_back(encodeLdrImm(5, 31, 0x20));                          // x5 = saved x4
+	instrs.push_back(encodeLdrImm(6, 31, 0x28));                          // x6 = saved x5
+	instrs.push_back(encodeLdrImm(7, 31, kHelperInlineWrapperRetOffset)); // x7 = return value
+
+	const size_t payloadMovIndex = instrs.size();
+	instrs.push_back(encodeMovz(16, 0, 0));
+	instrs.push_back(encodeMovk(16, 0, 16));
+	instrs.push_back(encodeMovk(16, 0, 32));
+	instrs.push_back(encodeMovk(16, 0, 48));
+	instrs.push_back(encodeBlr(16));
+
+	// Restore regs (x0 overwritten later with return value).
+	instrs.push_back(encodeLdrImm(30, 31, 0x58));
+	instrs.push_back(encodeLdpImm(16, 17, 31, 0x48));
+	instrs.push_back(encodeLdrImm(8, 31, 0x40));
+	instrs.push_back(encodeLdpImm(6, 7, 31, 0x30));
+	instrs.push_back(encodeLdpImm(4, 5, 31, 0x20));
+	instrs.push_back(encodeLdpImm(2, 3, 31, 0x10));
+	instrs.push_back(encodeLdpImm(0, 1, 31, 0x00));
+	instrs.push_back(encodeLdrImm(0, 31, kHelperInlineWrapperRetOffset)); // restore return value
+	instrs.push_back(encodeAddImm(31, 31, kHelperInlineDirectFormatFrameSize));
+	instrs.push_back(encodeRet());
+
+	const size_t bodySize = instrs.size() * sizeof(uint32_t);
+	if (bodySize != kHelperInlineWrapperBodySize) {
+		return false;
+	}
+	const size_t trampOffset = alignUp(bodySize, 4);
+	const size_t trampSize = kHelperInlineWrapperTrampSize;
+	const size_t blobOffset = alignUp(trampOffset + trampSize, 4);
+	const size_t totalSize = blobOffset + formatterBlob.size();
+	outStub.assign(totalSize, 0);
+	fillNops(outStub);
+
+	const uint64_t trampolineAddr = stubAddr + trampOffset;
+	const uint64_t payloadAddr = stubAddr + blobOffset + formatterEntryOffset;
+	patchMovSequence(instrs, trampMovIndex, 16, trampolineAddr);
+	patchMovSequence(instrs, payloadMovIndex, 16, payloadAddr);
+	memcpy(outStub.data(), instrs.data(), bodySize);
+
+	// Build trampoline: relocated prologue + branch to return address.
+	std::vector<uint32_t> tramp;
+	tramp.reserve(16);
+	tramp.push_back(originalInstr0);
+	tramp.push_back(originalInstr1);
+	tramp.push_back(originalInstr2);
+	tramp.push_back(originalInstr3);
+	tramp.push_back(originalInstr4);
+	uint32_t branchInstrs[5] = {};
+	encodeAbsoluteBranch(returnAddr, 17, branchInstrs);
+	for (const auto instr : branchInstrs) {
+		tramp.push_back(instr);
+	}
+	memcpy(outStub.data() + trampOffset, tramp.data(), tramp.size() * sizeof(uint32_t));
 	memcpy(outStub.data() + blobOffset, formatterBlob.data(), formatterBlob.size());
 	return true;
 }
@@ -695,6 +829,25 @@ public:
 
 	task_t taskPort() const {
 		return taskPort_;
+	}
+
+	pid_t pid() const {
+		return childPid_;
+	}
+
+	bool runForMillis(uint64_t millis) {
+		if (ptrace(PT_CONTINUE, childPid_, (caddr_t)1, 0) < 0) {
+			perror("ptrace(PT_CONTINUE)");
+			return false;
+		}
+		if (millis) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(millis));
+		}
+		if (kill(childPid_, SIGSTOP) < 0) {
+			perror("kill(SIGSTOP)");
+			return false;
+		}
+		return waitForStopped();
 	}
 
 	bool adjustMemoryProtection(uint64_t address, vm_prot_t protection, mach_vm_size_t size) {
@@ -750,6 +903,20 @@ public:
 			        static_cast<unsigned long long>(region), kr, mach_error_string(kr));
 			return false;
 		}
+		return true;
+	}
+
+	bool allocateMemory(uint64_t size, uint64_t &address) {
+		const vm_size_t pageSize = 0x1000;
+		const uint64_t aligned = (size + pageSize - 1) & ~(static_cast<uint64_t>(pageSize - 1));
+		mach_vm_address_t addr = 0;
+		const kern_return_t kr = mach_vm_allocate(taskPort_, &addr, aligned, VM_FLAGS_ANYWHERE);
+		if (kr != KERN_SUCCESS) {
+			fprintf(stderr, "Failed to allocate %llu bytes in target (error 0x%x: %s)\n",
+			        static_cast<unsigned long long>(aligned), kr, mach_error_string(kr));
+			return false;
+		}
+		address = addr;
 		return true;
 	}
 
@@ -817,6 +984,11 @@ private:
 			int signal = WSTOPSIG(status);
 			LOG("Process stopped signal=%d\n", signal);
 			return true;
+		}
+		if (WIFEXITED(status)) {
+			LOG("Process exited status=%d\n", WEXITSTATUS(status));
+		} else if (WIFSIGNALED(status)) {
+			LOG("Process terminated signal=%d\n", WTERMSIG(status));
 		}
 		return false;
 	}
@@ -1008,12 +1180,157 @@ static std::optional<uint64_t> findTrailingZeroCaveInRegion(MuhDebugger &dbg,
 	return candidate;
 }
 
+static std::optional<uint64_t> findPatternInProcess(MuhDebugger &dbg,
+                                                    const uint8_t *pattern,
+                                                    size_t patternSize,
+                                                    uint64_t maxBytes,
+                                                    uint64_t maxMillis) {
+	if (!pattern || patternSize == 0) {
+		return std::nullopt;
+	}
+	const size_t chunkSize = 1ull << 20;
+	mach_vm_address_t address = 0;
+	uint64_t scanned = 0;
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(maxMillis);
+	while (true) {
+		if (maxMillis && std::chrono::steady_clock::now() > deadline) {
+			break;
+		}
+		if (maxBytes && scanned >= maxBytes) {
+			break;
+		}
+		mach_vm_size_t regionSize = 0;
+		vm_region_basic_info_data_64_t info;
+		mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+		mach_port_t objectName = MACH_PORT_NULL;
+		const kern_return_t kr = mach_vm_region(dbg.taskPort(), &address, &regionSize,
+		                                        VM_REGION_BASIC_INFO_64,
+		                                        reinterpret_cast<vm_region_info_t>(&info),
+		                                        &count, &objectName);
+		if (kr != KERN_SUCCESS) {
+			break;
+		}
+		if (objectName != MACH_PORT_NULL) {
+			mach_port_deallocate(mach_task_self(), objectName);
+		}
+		if (!(info.protection & VM_PROT_READ)) {
+			address += regionSize;
+			continue;
+		}
+
+		std::vector<uint8_t> buffer(chunkSize + patternSize);
+		size_t carry = 0;
+		for (mach_vm_size_t offset = 0; offset < regionSize; offset += chunkSize) {
+			if (maxMillis && std::chrono::steady_clock::now() > deadline) {
+				return std::nullopt;
+			}
+			if (maxBytes && scanned >= maxBytes) {
+				return std::nullopt;
+			}
+			const mach_vm_size_t toRead = std::min<mach_vm_size_t>(chunkSize, regionSize - offset);
+			if (!dbg.readMemoryQuiet(address + offset, buffer.data() + carry, static_cast<size_t>(toRead))) {
+				carry = 0;
+				scanned += toRead;
+				continue;
+			}
+			const size_t total = carry + static_cast<size_t>(toRead);
+			if (total >= patternSize) {
+				const size_t limit = total - patternSize + 1;
+				for (size_t i = 0; i < limit; ++i) {
+					if (memcmp(buffer.data() + i, pattern, patternSize) == 0) {
+						return static_cast<uint64_t>(address + offset) + i - carry;
+					}
+				}
+			}
+			carry = 0;
+			if (patternSize > 1 && total >= patternSize - 1) {
+				carry = patternSize - 1;
+				memmove(buffer.data(), buffer.data() + total - carry, carry);
+			}
+			scanned += toRead;
+		}
+		address += regionSize;
+	}
+	return std::nullopt;
+}
+
+static std::optional<uint64_t> findWineControlBlock(MuhDebugger &dbg) {
+	const uint64_t magic0 = ROSETTA_WINE_CONTROL_MAGIC0;
+	const uint64_t magic1 = ROSETTA_WINE_CONTROL_MAGIC1;
+	uint8_t pattern[16] = {};
+	memcpy(pattern, &magic0, sizeof(magic0));
+	memcpy(pattern + sizeof(magic0), &magic1, sizeof(magic1));
+	const uint64_t maxBytes = parseEnvU64("ASTROWINE_WINE_CTRL_SCAN_MAX_MB",
+	                                      kWineCtrlScanMaxBytesDefault >> 20) << 20;
+	const uint64_t maxMillis = parseEnvU64("ASTROWINE_WINE_CTRL_SCAN_MAX_MS",
+	                                       kWineCtrlScanMaxMillisDefault);
+	return findPatternInProcess(dbg, pattern, sizeof(pattern), maxBytes, maxMillis);
+}
+
+static std::optional<uint64_t> allocateInlineState(MuhDebugger &dbg,
+                                                   uint64_t mapCapacity,
+                                                   uint64_t listCapacity) {
+	if (!mapCapacity || !listCapacity) {
+		return std::nullopt;
+	}
+	const size_t stateSize =
+		sizeof(rosetta_inline_state_header) +
+		mapCapacity * sizeof(rosetta_inline_map_entry) +
+		listCapacity * sizeof(uint64_t);
+	uint64_t addr = 0;
+	if (!dbg.allocateMemory(stateSize, addr)) {
+		return std::nullopt;
+	}
+	rosetta_inline_state_header header{};
+	header.magic = ROSETTA_INLINE_STATE_MAGIC;
+	header.version = ROSETTA_INLINE_STATE_VERSION;
+	header.initialized = 1;
+	header.lock = 0;
+	header.map_capacity = mapCapacity;
+	header.map_count = 0;
+	header.list_capacity = listCapacity;
+	header.list_count = 0;
+	if (!dbg.writeMemory(addr, &header, sizeof(header))) {
+		return std::nullopt;
+	}
+	return addr;
+}
+
+static bool patchInlineAddressMarker(std::vector<uint8_t> &blob,
+                                     uint64_t marker,
+                                     uint64_t value) {
+	if (blob.empty()) {
+		return false;
+	}
+	uint32_t markerInstrs[4] = {};
+	markerInstrs[0] = encodeMovz(15, static_cast<uint16_t>(marker & 0xffffu), 0);
+	markerInstrs[1] = encodeMovk(15, static_cast<uint16_t>((marker >> 16) & 0xffffu), 16);
+	markerInstrs[2] = encodeMovk(15, static_cast<uint16_t>((marker >> 32) & 0xffffu), 32);
+	markerInstrs[3] = encodeMovk(15, static_cast<uint16_t>((marker >> 48) & 0xffffu), 48);
+
+	uint32_t valueInstrs[4] = {};
+	valueInstrs[0] = encodeMovz(15, static_cast<uint16_t>(value & 0xffffu), 0);
+	valueInstrs[1] = encodeMovk(15, static_cast<uint16_t>((value >> 16) & 0xffffu), 16);
+	valueInstrs[2] = encodeMovk(15, static_cast<uint16_t>((value >> 32) & 0xffffu), 32);
+	valueInstrs[3] = encodeMovk(15, static_cast<uint16_t>((value >> 48) & 0xffffu), 48);
+
+	uint8_t markerBytes[sizeof(markerInstrs)] = {};
+	memcpy(markerBytes, markerInstrs, sizeof(markerInstrs));
+
+	for (size_t i = 0; i + sizeof(markerInstrs) <= blob.size(); i += 4) {
+		if (memcmp(blob.data() + i, markerBytes, sizeof(markerInstrs)) == 0) {
+			memcpy(blob.data() + i, valueInstrs, sizeof(valueInstrs));
+			return true;
+		}
+	}
+	return false;
+}
+
 static bool setupHelperInlineHook(MuhDebugger &dbg,
                                   uint64_t helperAddr,
                                   uint64_t runtimeBase,
                                   const std::vector<uint8_t> &formatBlob,
                                   uint64_t formatEntryOffset,
-                                  bool useSvcArg,
                                   const char *label) {
 	const char *tag = label ? label : "helper";
 	mach_vm_address_t regionStart = 0;
@@ -1105,7 +1422,7 @@ static bool setupHelperInlineHook(MuhDebugger &dbg,
 
 	std::vector<uint8_t> stub;
 	if (!buildHelperInlineDirectFormatStub(relocated0, relocated1, relocated2, relocated3, relocated4,
-	                                       stubAddr, helperAddr + 20, formatBlob, formatEntryOffset, useSvcArg, stub)) {
+	                                       stubAddr, helperAddr + 20, formatBlob, formatEntryOffset, stub)) {
 		fprintf(stderr, "%s: Failed to build helper inline formatted stub.\n", tag);
 		return false;
 	}
@@ -1144,6 +1461,129 @@ static bool setupHelperInlineHook(MuhDebugger &dbg,
 	return true;
 }
 
+static bool setupHelperInlineWrapperHook(MuhDebugger &dbg,
+                                         uint64_t helperAddr,
+                                         uint64_t runtimeBase,
+                                         const std::vector<uint8_t> &formatBlob,
+                                         uint64_t formatEntryOffset,
+                                         const char *label) {
+	const char *tag = label ? label : "helper";
+	mach_vm_address_t regionStart = 0;
+	mach_vm_size_t regionSize = 0;
+	vm_prot_t regionProt = 0;
+	if (!findExecRegionForAddress(dbg, helperAddr, regionStart, regionSize, regionProt)) {
+		fprintf(stderr, "%s: Failed to locate executable region for helper entry.\n", tag);
+		return false;
+	}
+	if (formatBlob.empty()) {
+		fprintf(stderr, "%s: Inline formatter blob is empty.\n", tag);
+		return false;
+	}
+	if (formatEntryOffset >= formatBlob.size()) {
+		fprintf(stderr, "%s: Inline formatter entry offset is out of range.\n", tag);
+		return false;
+	}
+	const char *runtimePath = "/usr/libexec/rosetta/runtime";
+	const size_t stubSize = kHelperInlineWrapperBodySize + kHelperInlineWrapperTrampSize + formatBlob.size();
+	const auto trailingCave = findTrailingZeroCaveInRegion(dbg, regionStart, regionSize, stubSize, 8);
+	std::optional<uint64_t> caveAddr;
+	if (trailingCave && runtimeBase != 0) {
+		const uint64_t fileOffset = *trailingCave - runtimeBase;
+		if (isFileRangeZero(runtimePath, fileOffset, stubSize)) {
+			caveAddr = trailingCave;
+		}
+	}
+	if (!caveAddr) {
+		auto candidate = findZeroCaveInRegion(dbg, regionStart, regionSize, helperAddr, stubSize, 8);
+		while (candidate && runtimeBase != 0) {
+			const uint64_t fileOffset = *candidate - runtimeBase;
+			if (isFileRangeZero(runtimePath, fileOffset, stubSize)) {
+				caveAddr = candidate;
+				break;
+			}
+			const uint64_t nextStart = *candidate + 8;
+			candidate = findZeroCaveInRegion(dbg, regionStart, regionSize, nextStart, stubSize, 8);
+		}
+		if (!caveAddr && candidate) {
+			caveAddr = candidate;
+		}
+	}
+	if (!caveAddr) {
+		fprintf(stderr, "%s: Failed to locate executable code cave for inline wrapper hook.\n", tag);
+		return false;
+	}
+	const uint64_t stubAddr = *caveAddr;
+
+	uint32_t originalInstr0 = 0;
+	uint32_t originalInstr1 = 0;
+	uint32_t originalInstr2 = 0;
+	uint32_t originalInstr3 = 0;
+	uint32_t originalInstr4 = 0;
+	if (!dbg.readMemory(helperAddr, &originalInstr0, sizeof(originalInstr0)) ||
+	    !dbg.readMemory(helperAddr + sizeof(uint32_t), &originalInstr1, sizeof(originalInstr1)) ||
+	    !dbg.readMemory(helperAddr + 2 * sizeof(uint32_t), &originalInstr2, sizeof(originalInstr2)) ||
+	    !dbg.readMemory(helperAddr + 3 * sizeof(uint32_t), &originalInstr3, sizeof(originalInstr3)) ||
+	    !dbg.readMemory(helperAddr + 4 * sizeof(uint32_t), &originalInstr4, sizeof(originalInstr4))) {
+		fprintf(stderr, "%s: Failed to read helper prologue for inline wrapper hook.\n", tag);
+		return false;
+	}
+
+	uint32_t relocated0 = 0;
+	uint32_t relocated1 = 0;
+	uint32_t relocated2 = 0;
+	uint32_t relocated3 = 0;
+	uint32_t relocated4 = 0;
+	const uint64_t relocateBase = stubAddr + alignUp(kHelperInlineWrapperBodySize, 4);
+	if (!relocateInstruction(originalInstr0, helperAddr, relocateBase, relocated0) ||
+	    !relocateInstruction(originalInstr1, helperAddr + 4, relocateBase + 4, relocated1) ||
+	    !relocateInstruction(originalInstr2, helperAddr + 8, relocateBase + 8, relocated2) ||
+	    !relocateInstruction(originalInstr3, helperAddr + 12, relocateBase + 12, relocated3) ||
+	    !relocateInstruction(originalInstr4, helperAddr + 16, relocateBase + 16, relocated4)) {
+		fprintf(stderr, "%s: Failed to relocate helper prologue for inline wrapper hook.\n", tag);
+		return false;
+	}
+
+	std::vector<uint8_t> stub;
+	if (!buildHelperInlineWrapperStub(relocated0, relocated1, relocated2, relocated3, relocated4,
+	                                  stubAddr, helperAddr + 20, formatBlob, formatEntryOffset, stub)) {
+		fprintf(stderr, "%s: Failed to build helper inline wrapper stub.\n", tag);
+		return false;
+	}
+
+	if (!dbg.adjustMemoryProtection(stubAddr, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, stub.size())) {
+		fprintf(stderr, "%s: Failed to adjust protection for helper inline wrapper stub.\n", tag);
+		return false;
+	}
+	if (!dbg.writeMemory(stubAddr, stub.data(), stub.size())) {
+		fprintf(stderr, "%s: Failed to write helper inline wrapper stub.\n", tag);
+		return false;
+	}
+	(void)dbg.flushInstructionCache(stubAddr, stub.size());
+	if (!dbg.adjustMemoryProtection(stubAddr, VM_PROT_READ | VM_PROT_EXECUTE, stub.size())) {
+		fprintf(stderr, "%s: Failed to restore protection for helper inline wrapper stub.\n", tag);
+		return false;
+	}
+
+	uint32_t patchInstrs[5] = {};
+	encodeAbsoluteBranch(stubAddr, 17, patchInstrs);
+	if (!dbg.adjustMemoryProtection(helperAddr, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, sizeof(patchInstrs))) {
+		fprintf(stderr, "%s: Failed to adjust protection for helper patch.\n", tag);
+		return false;
+	}
+	if (!dbg.writeMemory(helperAddr, patchInstrs, sizeof(patchInstrs))) {
+		fprintf(stderr, "%s: Failed to patch helper entry for inline wrapper hook.\n", tag);
+		return false;
+	}
+	(void)dbg.flushInstructionCache(helperAddr, sizeof(patchInstrs));
+	if (!dbg.adjustMemoryProtection(helperAddr, VM_PROT_READ | VM_PROT_EXECUTE, sizeof(patchInstrs))) {
+		fprintf(stderr, "%s: Failed to restore protection for helper patch.\n", tag);
+		return false;
+	}
+
+	hookLog("%s inline wrapper stub at 0x%llx\n", tag, static_cast<unsigned long long>(stubAddr));
+	return true;
+}
+
 int main(int argc, char *argv[]) {
 	if (argc < 2) {
 		fprintf(stderr, "%s <path to program>\n", argv[0]);
@@ -1153,6 +1593,9 @@ int main(int argc, char *argv[]) {
 	logsEnabled = getenv("ASTROWINE_LOGS");
 	const bool inlineHelperHook = getenv("ASTROWINE_HELPER_INLINE") != nullptr;
 	const bool inlineCStubRequested = getenv("ASTROWINE_HELPER_INLINE_C") != nullptr;
+	const bool disableJitWrapper = getenv("ASTROWINE_DISABLE_JIT_WRAPPER") != nullptr;
+	const bool disableWineCtrlScan = getenv("ASTROWINE_DISABLE_WINE_CTRL_SCAN") != nullptr;
+	const bool disableSyscallHook = getenv("ASTROWINE_DISABLE_SYSCALL_HOOK") != nullptr;
 	const char *inlineCPathEnv = getenv("ASTROWINE_HELPER_INLINE_C_PATH");
 
 	if (!inlineHelperHook || !inlineCStubRequested) {
@@ -1189,9 +1632,9 @@ int main(int argc, char *argv[]) {
 	}
 	LOG("Found rosetta runtime helper offsets successfully!\n");
 	LOG("offset_helper_syscall=%llx\n", offsetFinder.offsetHelperSyscall_);
-	LOG("offset_helper_resolve=%llx\n", offsetFinder.offsetHelperResolveAddr_);
-	if (offsetFinder.offsetHelperResolveAddr_ == 0) {
-		fprintf(stderr, "Failed to locate helper_resolve pattern in Rosetta runtime.\n");
+	LOG("offset_jit_translate=%llx\n", offsetFinder.offsetJitTranslate_);
+	if (!disableJitWrapper && offsetFinder.offsetJitTranslate_ == 0) {
+		fprintf(stderr, "Failed to locate jit translation pattern in Rosetta runtime.\n");
 		dbg.detach();
 		return 1;
 	}
@@ -1218,8 +1661,13 @@ int main(int argc, char *argv[]) {
 	}
 
 	LOG("helper_syscall address: 0x%llx\n", helperSyscallAddr);
-	const uint64_t helperResolveAddr = runtimeBase + offsetFinder.offsetHelperResolveAddr_;
-	LOG("helper_resolve address: 0x%llx\n", static_cast<unsigned long long>(helperResolveAddr));
+	uint64_t jitTranslateAddr = 0;
+	if (!disableJitWrapper && offsetFinder.offsetJitTranslate_ != 0) {
+		jitTranslateAddr = runtimeBase + offsetFinder.offsetJitTranslate_;
+		LOG("jit_translate address: 0x%llx\n", static_cast<unsigned long long>(jitTranslateAddr));
+	} else if (disableJitWrapper) {
+		LOG("jit_translate wrapper disabled by ASTROWINE_DISABLE_JIT_WRAPPER\n");
+	}
 
 	std::string blobPath;
 	if (inlineCPathEnv && *inlineCPathEnv) {
@@ -1247,20 +1695,94 @@ int main(int argc, char *argv[]) {
 	    static_cast<unsigned long long>(inlineSyscallOffset),
 	    static_cast<unsigned long long>(inlineResolveOffset));
 
-	if (!setupHelperInlineHook(dbg, helperSyscallAddr, runtimeBase, inlineFormatBlob, inlineSyscallOffset, true, "helper_syscall")) {
-		fprintf(stderr, "Inline helper_syscall hook failed.\n");
+	auto stateAddrOpt = allocateInlineState(dbg, kInlineMapCapacity, kInlineListCapacity);
+	if (!stateAddrOpt) {
+		fprintf(stderr, "Failed to allocate inline state buffer in target.\n");
 		dbg.detach();
 		return 1;
 	}
-	if (!setupHelperInlineHook(dbg, helperResolveAddr, runtimeBase, inlineFormatBlob, inlineResolveOffset, false, "helper_resolve")) {
-		fprintf(stderr, "Inline helper_resolve hook failed.\n");
+	const uint64_t stateAddr = *stateAddrOpt;
+	LOG("inline state buffer at 0x%llx\n", static_cast<unsigned long long>(stateAddr));
+
+	std::optional<uint64_t> wineCtrlAddrOpt;
+	bool didDelayStop = false;
+	if (!disableWineCtrlScan) {
+		const uint64_t delayMs = parseEnvU64("ASTROWINE_WINE_CTRL_SCAN_DELAY_MS",
+		                                     kWineCtrlScanDelayMillisDefault);
+		const uint64_t retryCount = parseEnvU64("ASTROWINE_WINE_CTRL_SCAN_RETRY_COUNT",
+		                                        kWineCtrlScanRetryCountDefault);
+		if (delayMs) {
+			LOG("Delaying wine control block scan by %llums\n",
+			    static_cast<unsigned long long>(delayMs));
+			if (!dbg.runForMillis(delayMs)) {
+				LOG("Failed to delay wine control block scan; process may have exited.\n");
+			} else {
+				didDelayStop = true;
+			}
+		}
+		wineCtrlAddrOpt = findWineControlBlock(dbg);
+		for (uint64_t attempt = 0; !wineCtrlAddrOpt && attempt < retryCount; ++attempt) {
+			if (delayMs) {
+				LOG("Retrying wine control block scan after %llums (attempt %llu)\n",
+				    static_cast<unsigned long long>(delayMs),
+				    static_cast<unsigned long long>(attempt + 1));
+				if (!dbg.runForMillis(delayMs)) {
+					LOG("Failed to delay wine control block scan; process may have exited.\n");
+					break;
+				} else {
+					didDelayStop = true;
+				}
+			}
+			wineCtrlAddrOpt = findWineControlBlock(dbg);
+		}
+	}
+	const uint64_t wineCtrlAddr = wineCtrlAddrOpt ? *wineCtrlAddrOpt : 0;
+	if (wineCtrlAddr) {
+		LOG("wine control block at 0x%llx\n", static_cast<unsigned long long>(wineCtrlAddr));
+	} else if (disableWineCtrlScan) {
+		LOG("wine control block scan disabled by ASTROWINE_DISABLE_WINE_CTRL_SCAN\n");
+	} else {
+		LOG("wine control block not found (range checks disabled).\n");
+	}
+
+	if (!patchInlineAddressMarker(inlineFormatBlob, ROSETTA_INLINE_STATE_ADDR_MARKER, stateAddr)) {
+		fprintf(stderr, "Failed to patch inline payload state marker.\n");
 		dbg.detach();
 		return 1;
+	}
+	if (!patchInlineAddressMarker(inlineFormatBlob, ROSETTA_INLINE_WINE_ADDR_MARKER, wineCtrlAddr)) {
+		fprintf(stderr, "Failed to patch inline payload wine marker.\n");
+		dbg.detach();
+		return 1;
+	}
+
+	if (!disableSyscallHook) {
+		if (!setupHelperInlineHook(dbg, helperSyscallAddr, runtimeBase, inlineFormatBlob, inlineSyscallOffset, "helper_syscall")) {
+			fprintf(stderr, "Inline helper_syscall hook failed.\n");
+			dbg.detach();
+			return 1;
+		}
+	} else {
+		LOG("helper_syscall hook disabled by ASTROWINE_DISABLE_SYSCALL_HOOK\n");
+	}
+	if (!disableJitWrapper) {
+		if (!setupHelperInlineWrapperHook(dbg, jitTranslateAddr, runtimeBase, inlineFormatBlob, inlineResolveOffset, "jit_translate")) {
+			fprintf(stderr, "Inline jit_translate wrapper hook failed.\n");
+			dbg.detach();
+			return 1;
+		}
 	}
 
 	if (!dbg.detach()) {
 		fprintf(stderr, "Failed to detach debugger\n");
 		return 1;
+	}
+	if (didDelayStop) {
+		if (kill(dbg.pid(), SIGCONT) < 0 && errno != ESRCH) {
+			perror("kill(SIGCONT)");
+		} else {
+			LOG("Resumed target after delayed scan.\n");
+		}
 	}
 
 	return 0;

@@ -44,16 +44,14 @@ namespace {
 
 auto OffsetFinder::setDefaultOffsets() -> void {
 	offsetHelperSyscall_ = 0;
-	offsetHelperResolveAddr_ = 0;
+	offsetJitTranslate_ = 0;
 }
 
 auto OffsetFinder::determineOffsets() -> bool {
 	const auto helperSyscallPattern = parsePattern(
 		"17 08 08 12 F7 7E 18 53 FF 06 00 71 ?? ?? ?? ?? FF 0A 00 71 ?? ?? ?? ?? FF 0E 00 71");
-	const auto helperResolvePattern = parsePattern(
-		"FF 03 01 D1 F6 57 01 A9 F4 4F 02 A9 FD 7B 03 A9 FD C3 00 91 ?? ?? ?? ?? "
-		"1F 05 00 71 ?? ?? ?? ?? F3 03 02 AA F4 03 01 AA ?? ?? ?? ?? ?? ?? ?? ?? "
-		"?? ?? ?? ?? ?? ?? ?? ?? E0 03 16 AA 03 00 80 D2");
+	const auto jitTranslatePattern = parsePattern(
+		"E0 03 16 AA 03 00 80 D2 E4 03 13 AA E5 03 15 AA");
 
 	std::ifstream file{"/usr/libexec/rosetta/runtime", std::ios::binary};
 	if (!file) {
@@ -72,7 +70,7 @@ auto OffsetFinder::determineOffsets() -> bool {
 	}
 
 	const auto helperSyscallOffset = findPattern(buffer, helperSyscallPattern);
-	const auto helperResolveOffset = findPattern(buffer, helperResolvePattern);
+	const auto jitTranslateMarker = findPattern(buffer, jitTranslatePattern);
 
 	if (!helperSyscallOffset) {
 		fprintf(stderr, "helper_syscall pattern not found in rosetta runtime binary.\n");
@@ -80,6 +78,14 @@ auto OffsetFinder::determineOffsets() -> bool {
 	}
 
 	offsetHelperSyscall_ = *helperSyscallOffset;
-	offsetHelperResolveAddr_ = helperResolveOffset ? *helperResolveOffset : 0;
+	if (jitTranslateMarker) {
+		constexpr std::uint64_t kPrologueBacktrack = 0x38;
+		if (*jitTranslateMarker >= kPrologueBacktrack) {
+			offsetJitTranslate_ = *jitTranslateMarker - kPrologueBacktrack;
+		}
+	}
+	if (offsetJitTranslate_ == 0) {
+		fprintf(stderr, "jit_translation pattern not found in rosetta runtime binary.\n");
+	}
 	return true;
 }
