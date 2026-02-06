@@ -56,6 +56,36 @@ static inline __attribute__((always_inline)) uint64_t sys_kill(uint64_t pid, uin
 	return r0;
 }
 
+static inline __attribute__((always_inline)) uint64_t sys_thread_selfid(void) {
+	register uint64_t r0 asm("x0") = 0;
+	register uint64_t r16 asm("x16") = 372; // SYS_thread_selfid
+	__asm__ volatile("svc #0x80"
+	                 : "+r"(r0)
+	                 : "r"(r16)
+	                 : "memory", "x1", "x2", "x3", "x4", "x5", "x6", "x7");
+	return r0;
+}
+
+static inline __attribute__((always_inline)) uint64_t sys_pthread_kill(uint64_t tid, uint64_t sig) {
+	register uint64_t r0 asm("x0") = tid;
+	register uint64_t r1 asm("x1") = sig;
+	register uint64_t r16 asm("x16") = 328; // SYS___pthread_kill
+	__asm__ volatile("svc #0x80"
+	                 : "+r"(r0)
+	                 : "r"(r1), "r"(r16)
+	                 : "memory", "x2", "x3", "x4", "x5", "x6", "x7");
+	return r0;
+}
+
+static inline __attribute__((always_inline)) uint64_t current_pthread_kill_id(void) {
+	/* libpthread stores the kernel thread id used by __pthread_kill at
+	 * (pthread_self + 0xf8). On arm64 macOS, pthread_self is TPIDRRO_EL0 - 0xe0,
+	 * so the id sits at TPIDRRO_EL0 + 0x18. */
+	uint64_t tpidrro = 0;
+	__asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tpidrro));
+	return *(volatile uint32_t *)(uintptr_t)(tpidrro + 0x18u);
+}
+
 static inline __attribute__((always_inline)) void dmb_ish(void) {
 	__asm__ volatile("dmb ish" ::: "memory");
 }
@@ -91,6 +121,8 @@ struct AstroWineState {
 struct AstroWineWineShm {
 	uint64_t magic;
 	uint32_t version;
+	/* pending states:
+	 * 0 = idle, 1 = ready for Wine handler, 2 = write-locked by payload */
 	volatile uint32_t pending;
 	uint64_t syscall_nr;
 	uint64_t syscall_rip;
@@ -109,6 +141,16 @@ struct AstroWineWineShm {
 	uint64_t r14;
 	uint64_t r15;
 };
+
+static inline __attribute__((always_inline)) int claim_wine_shm_slot(volatile uint32_t *pending) {
+	for (uint32_t i = 0; i < 1000000u; ++i) {
+		uint32_t expected = 0;
+		if (__atomic_compare_exchange_n((uint32_t *)pending, &expected, 2u, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+			return 1;
+		}
+	}
+	return 0;
+}
 
 static inline __attribute__((always_inline)) void spin_lock(volatile uint32_t *lock) {
 	uint32_t value;
@@ -292,7 +334,9 @@ uint64_t rosetta_helper_syscall_inline(char *out,
 	}
 	spin_unlock(&st->lock);
 
-	const uint64_t x86_site = x86_func ? x86_func : x86_rcx_rip;
+	/* Use the exact x86 trap site (RCX semantics of SYSCALL) whenever available.
+	 * The arm->x86 function floor mapping can resolve to a wrapper thunk. */
+	const uint64_t x86_site = x86_rcx_rip ? x86_rcx_rip : x86_func;
 	const uint64_t threshold = st->native_threshold_x86;
 	int should_intercept = 0;
 	if ((st->flags & ASTROWINE_STATE_FLAG_INTERCEPT) && interceptable) {
@@ -308,6 +352,11 @@ uint64_t rosetta_helper_syscall_inline(char *out,
 
 	// Communicate syscall info to Wine via a fixed shared struct, then raise SIGSYS.
 	struct AstroWineWineShm *shm = (struct AstroWineWineShm *)(uintptr_t)st->wine_shm_ptr;
+	if (!claim_wine_shm_slot(&shm->pending)) {
+		maybe_log_syscall(out, st, sysnum, lr, arm_func, x86_site, "syscall(shm-busy)");
+		return 0;
+	}
+
 	shm->syscall_nr = sysnum;
 	/* Preserve a seccomp-like trap site whenever possible. */
 	shm->syscall_rip = x86_site;
@@ -327,12 +376,35 @@ uint64_t rosetta_helper_syscall_inline(char *out,
 	shm->r14 = regs[14];
 	shm->r15 = regs[15];
 	dmb_ish();
-	shm->pending = 1;
+	__atomic_store_n((uint32_t *)&shm->pending, 1u, __ATOMIC_RELEASE);
 
 	maybe_log_syscall(out, st, sysnum, lr, arm_func, x86_func, "syscall(TRAP)");
 
-	const uint64_t pid = sys_getpid();
-	(void)sys_kill(pid, 12 /* SIGSYS */);
+	const uint64_t tid = current_pthread_kill_id();
+	uint64_t raise_result = (uint64_t)-1;
+	if (tid != 0) {
+		raise_result = sys_pthread_kill(tid, 12 /* SIGSYS */);
+	}
+	if (raise_result != 0) {
+		const uint64_t tid_selfid = sys_thread_selfid();
+		if (tid_selfid != 0 && tid_selfid != (uint64_t)-1) {
+			raise_result = sys_pthread_kill(tid_selfid, 12 /* SIGSYS */);
+		}
+	}
+	if (raise_result != 0) {
+		const uint64_t pid = sys_getpid();
+		raise_result = sys_kill(pid, 12 /* SIGSYS */);
+	}
+
+	/* Best effort: if signal was handled in-place, pending will be cleared by Wine handler. */
+	for (uint32_t i = 0; i < 1000000u; ++i) {
+		if (__atomic_load_n((uint32_t *)&shm->pending, __ATOMIC_ACQUIRE) == 0) {
+			break;
+		}
+	}
+	if (__atomic_load_n((uint32_t *)&shm->pending, __ATOMIC_ACQUIRE) != 0) {
+		__atomic_store_n((uint32_t *)&shm->pending, 0u, __ATOMIC_RELEASE);
+	}
 
 	// If the Wine SIGSYS handler doesn't redirect for some reason, tell the stub to skip the original helper.
 	return 1;
