@@ -46,8 +46,6 @@ constexpr uint64_t kWineCtrlScanMaxBytesDefault = 2048ull << 20;
 constexpr uint64_t kWineCtrlScanMaxMillisDefault = 6000;
 constexpr uint64_t kWineCtrlScanDelayMillisDefault = 200;
 constexpr uint64_t kWineCtrlScanRetryCountDefault = 0;
-constexpr uint64_t kInlineStateSampleMillisDefault = 0;
-constexpr uint64_t kInlineStateSampleCountDefault = 1;
 
 static void initHookLog() {
 	if (hookLogInitialized) {
@@ -1298,22 +1296,6 @@ static std::optional<uint64_t> allocateInlineState(MuhDebugger &dbg,
 	return addr;
 }
 
-static bool readInlineStateHeader(MuhDebugger &dbg,
-                                  uint64_t addr,
-                                  rosetta_inline_state_header &out) {
-	if (!addr) {
-		return false;
-	}
-	if (!dbg.readMemory(addr, &out, sizeof(out))) {
-		return false;
-	}
-	if (out.magic != ROSETTA_INLINE_STATE_MAGIC ||
-	    out.version != ROSETTA_INLINE_STATE_VERSION) {
-		return false;
-	}
-	return true;
-}
-
 static bool patchInlineAddressMarker(std::vector<uint8_t> &blob,
                                      uint64_t marker,
                                      uint64_t value) {
@@ -1791,37 +1773,11 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	const uint64_t sampleMs = parseEnvU64("ASTROWINE_INLINE_STATE_SAMPLE_MS",
-	                                      kInlineStateSampleMillisDefault);
-	const uint64_t sampleCount = parseEnvU64("ASTROWINE_INLINE_STATE_SAMPLE_COUNT",
-	                                         kInlineStateSampleCountDefault);
-	bool didSampleStop = false;
-	if (sampleMs && sampleCount) {
-		for (uint64_t i = 0; i < sampleCount; ++i) {
-			LOG("Sampling inline state after %llums (sample %llu)\n",
-			    static_cast<unsigned long long>(sampleMs),
-			    static_cast<unsigned long long>(i + 1));
-			if (!dbg.runForMillis(sampleMs)) {
-				LOG("Failed to sample inline state; process may have exited.\n");
-				break;
-			}
-			didSampleStop = true;
-			rosetta_inline_state_header header{};
-			if (readInlineStateHeader(dbg, stateAddr, header)) {
-				LOG("inline state: map_count=%llu list_count=%llu\n",
-				    static_cast<unsigned long long>(header.map_count),
-				    static_cast<unsigned long long>(header.list_count));
-			} else {
-				LOG("inline state: failed to read header.\n");
-			}
-		}
-	}
-
 	if (!dbg.detach()) {
 		fprintf(stderr, "Failed to detach debugger\n");
 		return 1;
 	}
-	if (didDelayStop || didSampleStop) {
+	if (didDelayStop) {
 		if (kill(dbg.pid(), SIGCONT) < 0 && errno != ESRCH) {
 			perror("kill(SIGCONT)");
 		} else {
