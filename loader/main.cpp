@@ -33,7 +33,7 @@ extern "C" void _dyld_process_info_for_each_image(DyldProcessInfo info, void (^c
 extern "C" void _dyld_process_info_release(DyldProcessInfo info);
 
 const char *logsEnabled = nullptr;
-static bool hookLogsEnabled = true;
+static bool hookLogsEnabled = false;
 static bool hookLogInitialized = false;
 static int hookLogFd = -1;
 static int hookLogSinkFd = STDERR_FILENO;
@@ -45,12 +45,21 @@ static void initHookLog() {
 	hookLogInitialized = true;
 
 	const char *env = getenv("ASTROWINE_HOOK_LOGS");
-	if (env && strcmp(env, "0") == 0) {
+	const char *logPath = getenv("ASTROWINE_HOOK_LOG_PATH");
+
+	// Keep hook logging quiet by default; enable only when explicitly requested.
+	hookLogsEnabled = false;
+	if (env && strcmp(env, "0") != 0) {
+		hookLogsEnabled = true;
+	}
+	if (logPath && *logPath) {
+		hookLogsEnabled = true;
+	}
+	if (!hookLogsEnabled) {
 		hookLogsEnabled = false;
 		return;
 	}
 
-	const char *logPath = getenv("ASTROWINE_HOOK_LOG_PATH");
 	if (logPath && *logPath) {
 		const int fd = open(logPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
 		if (fd >= 0) {
@@ -120,6 +129,20 @@ static void hookLog(const char *fmt, ...) {
             printf(fmt, ##__VA_ARGS__); \
         }                               \
     } while (0)
+
+static bool envFlagEnabled(const char *name, bool defaultValue) {
+	const char *value = getenv(name);
+	if (!value || !*value) {
+		return defaultValue;
+	}
+	if (strcmp(value, "0") == 0 ||
+	    strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 || strcmp(value, "False") == 0 ||
+	    strcmp(value, "no") == 0 || strcmp(value, "NO") == 0 || strcmp(value, "No") == 0 ||
+	    strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0 || strcmp(value, "Off") == 0) {
+		return false;
+	}
+	return true;
+}
 
 static bool readFileAt(const char *path, uint64_t offset, void *buffer, size_t size) {
 	if (!path || !buffer || size == 0) {
@@ -322,6 +345,13 @@ static uint64_t alignUp(uint64_t value, uint64_t alignment) {
 	return (value + alignment - 1) & ~(alignment - 1);
 }
 
+static uint64_t alignDown(uint64_t value, uint64_t alignment) {
+	if (alignment == 0) {
+		return value;
+	}
+	return value & ~(alignment - 1);
+}
+
 static bool isFileRangeZero(const char *path, uint64_t offset, size_t size) {
 	if (!path || size == 0) {
 		return false;
@@ -390,6 +420,12 @@ static uint32_t encodeLdpImm(uint8_t rt, uint8_t rt2, uint8_t rn, int16_t immByt
 
 static uint32_t encodeBlr(uint8_t reg) {
 	return 0xD63F0000u | (static_cast<uint32_t>(reg & 0x1fu) << 5);
+}
+
+static uint32_t encodeCbzW(uint8_t reg, int32_t immBytes) {
+	// imm19 is signed and scaled by 4.
+	const int32_t imm19 = immBytes >> 2;
+	return 0x34000000u | ((static_cast<uint32_t>(imm19) & 0x7ffffu) << 5) | (reg & 0x1fu);
 }
 
 static void encodeAbsoluteBranch(uint64_t target, uint8_t reg, uint32_t outInstrs[5]) {
@@ -545,6 +581,13 @@ constexpr size_t kHelperInlineDirectFormatBufferSize = 0x100;
 constexpr size_t kHelperInlineDirectFormatOrigOffset = 0x6C;
 constexpr size_t kHelperInlineDirectFormatBodySize = kHelperInlineDirectFormatOrigOffset + 40;
 
+// Syscall helper stubs need access to the full x86->arm register mapping at helper entry,
+// so they reserve a larger save area and pass a pointer to it into the C payload.
+constexpr size_t kHelperSyscallInlineFrameSize = 0x1A0;
+constexpr size_t kHelperSyscallInlineSaveAreaSize = 0xA0;
+constexpr size_t kHelperSyscallInlineBufferOffset = kHelperSyscallInlineSaveAreaSize;
+constexpr size_t kHelperSyscallInlineBufferSize = 0x100;
+
 static void fillNops(std::vector<uint8_t> &buffer) {
 	static const uint8_t nop[4] = {0x1F, 0x20, 0x03, 0xD5};
 	for (size_t i = 0; i + 3 < buffer.size(); i += 4) {
@@ -647,6 +690,277 @@ static bool buildHelperInlineDirectFormatStub(uint32_t originalInstr0,
 	return true;
 }
 
+// Must match payload/rosetta_inline_payload.c.
+static constexpr uint64_t kAstroWineStateMagic = 0x0031545357525453ull; // "STRWST1\0" LE
+static constexpr uint32_t kAstroWineStateVersion = 1u;
+
+static constexpr uint64_t kAstroWineWineShmPtrDefault = 0x7ffe1100ull; // user_shared_data (0x7ffe0000) + 0x1000 + 0x100
+
+enum AstroWineStateFlags : uint32_t {
+	ASTROWINE_STATE_FLAG_LOG_SYSCALL = 1u << 0,
+	ASTROWINE_STATE_FLAG_LOG_RESOLVE = 1u << 1,
+	ASTROWINE_STATE_FLAG_INTERCEPT = 1u << 2,
+};
+
+struct AstroWineStateHeader {
+	uint64_t magic;
+	uint32_t version;
+	uint32_t lock;
+	uint32_t count;
+	uint32_t capacity;
+	uint64_t native_threshold_x86;
+	uint64_t wine_shm_ptr;
+	uint32_t flags;
+	uint32_t _pad;
+};
+static_assert(sizeof(AstroWineStateHeader) == 48, "AstroWineStateHeader layout mismatch");
+
+static bool buildHelperSyscallInterceptStub(uint32_t originalInstrs[5],
+                                            uint64_t helperAddr,
+                                            uint64_t stubAddr,
+                                            uint64_t returnAddr,
+                                            uint64_t payloadBaseAddr,
+                                            uint64_t payloadEntryOffset,
+                                            uint64_t stateAddr,
+                                            uint64_t runtimeExitRetAddr,
+                                            bool relocateOriginal,
+                                            std::vector<uint8_t> &outStub) {
+	if (!payloadBaseAddr) return false;
+
+	std::vector<uint32_t> instrs;
+	instrs.reserve(96);
+
+	// Save regs + output buffer.
+	instrs.push_back(encodeSubImm(31, 31, kHelperSyscallInlineFrameSize));
+	instrs.push_back(encodeStpImm(0, 1, 31, 0x00));
+	instrs.push_back(encodeStpImm(2, 3, 31, 0x10));
+	instrs.push_back(encodeStpImm(4, 5, 31, 0x20));
+	instrs.push_back(encodeStpImm(6, 7, 31, 0x30));
+	instrs.push_back(encodeStpImm(8, 9, 31, 0x40));
+	instrs.push_back(encodeStpImm(10, 11, 31, 0x50));
+	instrs.push_back(encodeStpImm(12, 13, 31, 0x60));
+	instrs.push_back(encodeStpImm(14, 15, 31, 0x70));
+	instrs.push_back(encodeStpImm(16, 17, 31, 0x80));
+	instrs.push_back(encodeStrImm(30, 31, 0x90));
+
+	// Call payload: (out, state, sysnum, lr, regs_ptr) -> returns non-zero to skip original helper.
+	instrs.push_back(encodeAddImm(0, 31, kHelperSyscallInlineBufferOffset)); // x0 = buffer
+	{
+		const uint64_t state = stateAddr;
+		instrs.push_back(encodeMovz(1, static_cast<uint16_t>(state & 0xffffu), 0));
+		instrs.push_back(encodeMovk(1, static_cast<uint16_t>((state >> 16) & 0xffffu), 16));
+		instrs.push_back(encodeMovk(1, static_cast<uint16_t>((state >> 32) & 0xffffu), 32));
+		instrs.push_back(encodeMovk(1, static_cast<uint16_t>((state >> 48) & 0xffffu), 48));
+	}
+	instrs.push_back(encodeLdrImm(2, 31, 0x00)); // x2 = saved x0 (sysnum)
+	instrs.push_back(encodeLdrImm(3, 31, 0x90)); // x3 = saved x30 (return addr)
+	instrs.push_back(encodeAddImm(4, 31, 0x00)); // x4 = regs_ptr (saved x0..x15)
+
+	const size_t payloadAddrIdx = instrs.size();
+	instrs.push_back(0); // movz x16, ...
+	instrs.push_back(0); // movk x16, ...
+	instrs.push_back(0); // movk x16, ...
+	instrs.push_back(0); // movk x16, ...
+	instrs.push_back(encodeBlr(16));
+
+	const size_t cbzIdx = instrs.size();
+	instrs.push_back(0); // cbz w0, continue
+
+	// Intercept path: restore regs, dealloc frame, and jump to runtime_exit_ret.
+	auto emitRestoreAndExitRet = [&instrs, runtimeExitRetAddr]() {
+		instrs.push_back(encodeLdrImm(30, 31, 0x90));
+		instrs.push_back(encodeLdpImm(16, 17, 31, 0x80));
+		instrs.push_back(encodeLdpImm(14, 15, 31, 0x70));
+		instrs.push_back(encodeLdpImm(12, 13, 31, 0x60));
+		instrs.push_back(encodeLdpImm(10, 11, 31, 0x50));
+		instrs.push_back(encodeLdpImm(8, 9, 31, 0x40));
+		instrs.push_back(encodeLdpImm(6, 7, 31, 0x30));
+		instrs.push_back(encodeLdpImm(4, 5, 31, 0x20));
+		instrs.push_back(encodeLdpImm(2, 3, 31, 0x10));
+		instrs.push_back(encodeLdpImm(0, 1, 31, 0x00));
+		instrs.push_back(encodeAddImm(31, 31, kHelperSyscallInlineFrameSize));
+
+		uint32_t branchInstrs[5] = {};
+		encodeAbsoluteBranch(runtimeExitRetAddr, 17, branchInstrs);
+		for (const auto instr : branchInstrs) instrs.push_back(instr);
+	};
+	emitRestoreAndExitRet();
+
+	const size_t continueLabelIdx = instrs.size();
+
+	// Continue path: restore regs, dealloc frame, run relocated original instructions, then jump back.
+	instrs.push_back(encodeLdrImm(30, 31, 0x90));
+	instrs.push_back(encodeLdpImm(16, 17, 31, 0x80));
+	instrs.push_back(encodeLdpImm(14, 15, 31, 0x70));
+	instrs.push_back(encodeLdpImm(12, 13, 31, 0x60));
+	instrs.push_back(encodeLdpImm(10, 11, 31, 0x50));
+	instrs.push_back(encodeLdpImm(8, 9, 31, 0x40));
+	instrs.push_back(encodeLdpImm(6, 7, 31, 0x30));
+	instrs.push_back(encodeLdpImm(4, 5, 31, 0x20));
+	instrs.push_back(encodeLdpImm(2, 3, 31, 0x10));
+	instrs.push_back(encodeLdpImm(0, 1, 31, 0x00));
+	instrs.push_back(encodeAddImm(31, 31, kHelperSyscallInlineFrameSize));
+
+	for (size_t i = 0; i < 5; ++i) {
+		uint32_t instr = originalInstrs[i];
+		if (relocateOriginal) {
+			const uint64_t origAddr = helperAddr + i * 4;
+			const uint64_t newAddr = stubAddr + instrs.size() * 4;
+			uint32_t relocated = 0;
+			if (!relocateInstruction(instr, origAddr, newAddr, relocated)) {
+				return false;
+			}
+			instr = relocated;
+		} else {
+			instr = 0xD503201Fu; // nop
+		}
+		instrs.push_back(instr);
+	}
+
+	{
+		uint32_t branchInstrs[5] = {};
+		encodeAbsoluteBranch(returnAddr, 17, branchInstrs);
+		for (const auto instr : branchInstrs) instrs.push_back(instr);
+	}
+
+	// Patch CBZ to jump over the intercept path to the continue label when w0 == 0.
+	{
+		const int32_t cbzAddr = static_cast<int32_t>(cbzIdx * 4);
+		const int32_t contAddr = static_cast<int32_t>(continueLabelIdx * 4);
+		const int32_t diff = contAddr - cbzAddr;
+		instrs[cbzIdx] = encodeCbzW(0, diff);
+	}
+
+	const size_t bodyBytes = instrs.size() * sizeof(uint32_t);
+	{
+		const uint64_t payloadAddr = payloadBaseAddr + payloadEntryOffset;
+		instrs[payloadAddrIdx + 0] = encodeMovz(16, static_cast<uint16_t>(payloadAddr & 0xffffu), 0);
+		instrs[payloadAddrIdx + 1] = encodeMovk(16, static_cast<uint16_t>((payloadAddr >> 16) & 0xffffu), 16);
+		instrs[payloadAddrIdx + 2] = encodeMovk(16, static_cast<uint16_t>((payloadAddr >> 32) & 0xffffu), 32);
+		instrs[payloadAddrIdx + 3] = encodeMovk(16, static_cast<uint16_t>((payloadAddr >> 48) & 0xffffu), 48);
+	}
+	outStub.assign(bodyBytes, 0);
+	fillNops(outStub);
+	memcpy(outStub.data(), instrs.data(), bodyBytes);
+	return true;
+}
+
+static bool buildHelperResolveMapStub(uint32_t originalInstrs[5],
+                                      uint64_t helperAddr,
+                                      uint64_t stubAddr,
+                                      uint64_t returnAddr,
+                                      uint64_t payloadBaseAddr,
+                                      uint64_t payloadEntryOffset,
+                                      uint64_t stateAddr,
+                                      bool relocateOriginal,
+                                      std::vector<uint8_t> &outStub) {
+	if (!payloadBaseAddr) return false;
+
+	std::vector<uint32_t> instrs;
+	instrs.reserve(96);
+
+	// Save regs + output buffer.
+	instrs.push_back(encodeSubImm(31, 31, kHelperInlineDirectFormatFrameSize));
+	instrs.push_back(encodeStpImm(0, 1, 31, 0x00));
+	instrs.push_back(encodeStpImm(2, 3, 31, 0x10));
+	instrs.push_back(encodeStpImm(4, 5, 31, 0x20));
+	instrs.push_back(encodeStpImm(6, 7, 31, 0x30));
+	instrs.push_back(encodeStrImm(8, 31, 0x40));
+	instrs.push_back(encodeStpImm(16, 17, 31, 0x48));
+	instrs.push_back(encodeStrImm(30, 31, 0x58));
+
+	// Call an internal trampoline which runs the relocated original prologue and jumps into the helper body.
+	// We use BLR so LR points back into this stub.
+	// We'll patch trampoline address after we know final offsets; since it's inside the same stub,
+	// we can compute it based on the current instruction count and the fixed sequence below.
+	const size_t trampolineAddrIdx = instrs.size();
+	instrs.push_back(0); // movz x17, ...
+	instrs.push_back(0); // movk x17, ...
+	instrs.push_back(0); // movk x17, ...
+	instrs.push_back(0); // movk x17, ...
+	instrs.push_back(encodeBlr(17));
+
+	// Save return value (overwrite saved x0 so restore path returns correctly).
+	instrs.push_back(encodeStrImm(0, 31, 0x00));
+
+	// Call payload: (out, state, x86_addr, arm_addr).
+	instrs.push_back(encodeAddImm(0, 31, kHelperInlineDirectFormatBufferOffset)); // x0 = buffer
+	{
+		const uint64_t state = stateAddr;
+		instrs.push_back(encodeMovz(1, static_cast<uint16_t>(state & 0xffffu), 0));
+		instrs.push_back(encodeMovk(1, static_cast<uint16_t>((state >> 16) & 0xffffu), 16));
+		instrs.push_back(encodeMovk(1, static_cast<uint16_t>((state >> 32) & 0xffffu), 32));
+		instrs.push_back(encodeMovk(1, static_cast<uint16_t>((state >> 48) & 0xffffu), 48));
+	}
+	instrs.push_back(encodeLdrImm(2, 31, 0x08)); // x2 = saved x1 (x86 addr)
+	instrs.push_back(encodeLdrImm(3, 31, 0x00)); // x3 = saved x0 (arm addr)
+
+	const size_t payloadAddrIdx = instrs.size();
+	instrs.push_back(0); // movz x16, ...
+	instrs.push_back(0); // movk x16, ...
+	instrs.push_back(0); // movk x16, ...
+	instrs.push_back(0); // movk x16, ...
+	instrs.push_back(encodeBlr(16));
+
+	// Restore regs and return.
+	instrs.push_back(encodeLdrImm(30, 31, 0x58));
+	instrs.push_back(encodeLdpImm(16, 17, 31, 0x48));
+	instrs.push_back(encodeLdrImm(8, 31, 0x40));
+	instrs.push_back(encodeLdpImm(6, 7, 31, 0x30));
+	instrs.push_back(encodeLdpImm(4, 5, 31, 0x20));
+	instrs.push_back(encodeLdpImm(2, 3, 31, 0x10));
+	instrs.push_back(encodeLdpImm(0, 1, 31, 0x00));
+	instrs.push_back(encodeAddImm(31, 31, kHelperInlineDirectFormatFrameSize));
+	instrs.push_back(0xD65F03C0u); // ret
+
+	// Trampoline starts here.
+	const size_t trampolineInstrIndex = instrs.size();
+	const uint64_t trampolineAddr = stubAddr + trampolineInstrIndex * 4;
+
+	for (size_t i = 0; i < 5; ++i) {
+		uint32_t instr = originalInstrs[i];
+		if (relocateOriginal) {
+			const uint64_t origAddr = helperAddr + i * 4;
+			const uint64_t newAddr = stubAddr + instrs.size() * 4;
+			uint32_t relocated = 0;
+			if (!relocateInstruction(instr, origAddr, newAddr, relocated)) {
+				return false;
+			}
+			instr = relocated;
+		} else {
+			instr = 0xD503201Fu; // nop
+		}
+		instrs.push_back(instr);
+	}
+	{
+		uint32_t branchInstrs[5] = {};
+		encodeAbsoluteBranch(returnAddr, 17, branchInstrs);
+		for (const auto instr : branchInstrs) instrs.push_back(instr);
+	}
+
+	// Patch trampoline address load (movz/movk into x17).
+	{
+		const uint64_t t = trampolineAddr;
+		instrs[trampolineAddrIdx + 0] = encodeMovz(17, static_cast<uint16_t>(t & 0xffffu), 0);
+		instrs[trampolineAddrIdx + 1] = encodeMovk(17, static_cast<uint16_t>((t >> 16) & 0xffffu), 16);
+		instrs[trampolineAddrIdx + 2] = encodeMovk(17, static_cast<uint16_t>((t >> 32) & 0xffffu), 32);
+		instrs[trampolineAddrIdx + 3] = encodeMovk(17, static_cast<uint16_t>((t >> 48) & 0xffffu), 48);
+	}
+
+	const size_t bodyBytes = instrs.size() * sizeof(uint32_t);
+	{
+		const uint64_t payloadAddr = payloadBaseAddr + payloadEntryOffset;
+		instrs[payloadAddrIdx + 0] = encodeMovz(16, static_cast<uint16_t>(payloadAddr & 0xffffu), 0);
+		instrs[payloadAddrIdx + 1] = encodeMovk(16, static_cast<uint16_t>((payloadAddr >> 16) & 0xffffu), 16);
+		instrs[payloadAddrIdx + 2] = encodeMovk(16, static_cast<uint16_t>((payloadAddr >> 32) & 0xffffu), 32);
+		instrs[payloadAddrIdx + 3] = encodeMovk(16, static_cast<uint16_t>((payloadAddr >> 48) & 0xffffu), 48);
+	}
+	outStub.assign(bodyBytes, 0);
+	fillNops(outStub);
+	memcpy(outStub.data(), instrs.data(), bodyBytes);
+	return true;
+}
+
 class MuhDebugger {
 public:
 	~MuhDebugger() {
@@ -657,29 +971,13 @@ public:
 
 	bool attach(pid_t pid) {
 		childPid_ = pid;
-		LOG("Attempting to attach to %d\n", childPid_);
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-		if (ptrace(PT_ATTACH, childPid_, 0, 0) < 0) {
-#pragma clang diagnostic pop
-			perror("ptrace(PT_ATTACH)");
-			return false;
-		}
+		LOG("Waiting for child exec stop (PT_TRACE_ME)...\n");
+		if (!waitForStopped()) return false;
 
-		if (!waitForStopped()) {
-			return false;
-		}
-		LOG("Program stopped due to debugger being attached\n");
-
-		if (!continueExecution()) {
-			fprintf(stderr, "Failed to continue execution\n");
-			return false;
-		}
 		if (task_for_pid(mach_task_self(), childPid_, &taskPort_) != KERN_SUCCESS) {
 			fprintf(stderr, "Failed to get task port for pid %d\n", childPid_);
 			return false;
 		}
-		LOG("Program stopped due to execv into rosetta process.\n");
 		LOG("Started debugging process %d using port %d\n", childPid_, taskPort_);
 		return true;
 	}
@@ -1008,106 +1306,94 @@ static std::optional<uint64_t> findTrailingZeroCaveInRegion(MuhDebugger &dbg,
 	return candidate;
 }
 
-static bool setupHelperInlineHook(MuhDebugger &dbg,
-                                  uint64_t helperAddr,
-                                  uint64_t runtimeBase,
-                                  const std::vector<uint8_t> &formatBlob,
-                                  uint64_t formatEntryOffset,
-                                  bool useSvcArg,
-                                  const char *label) {
-	const char *tag = label ? label : "helper";
-	mach_vm_address_t regionStart = 0;
-	mach_vm_size_t regionSize = 0;
-	vm_prot_t regionProt = 0;
-	if (!findExecRegionForAddress(dbg, helperAddr, regionStart, regionSize, regionProt)) {
-		fprintf(stderr, "%s: Failed to locate executable region for helper entry.\n", tag);
-		return false;
+struct TrailingZeroRun {
+	uint64_t start;
+	uint64_t end;
+	size_t length;
+};
+
+static std::optional<TrailingZeroRun> findTrailingZeroRunInRegion(MuhDebugger &dbg,
+                                                                  uint64_t regionStart,
+                                                                  uint64_t regionSize) {
+	if (regionSize == 0) {
+		return std::nullopt;
 	}
-	if (formatBlob.empty()) {
-		fprintf(stderr, "%s: Inline formatter blob is empty.\n", tag);
-		return false;
-	}
-	if (formatEntryOffset >= formatBlob.size()) {
-		fprintf(stderr, "%s: Inline formatter entry offset is out of range.\n", tag);
-		return false;
-	}
-	const char *runtimePath = "/usr/libexec/rosetta/runtime";
-	const size_t stubSize = alignUp(kHelperInlineDirectFormatBodySize, 4) + formatBlob.size();
-	const auto trailingCave = findTrailingZeroCaveInRegion(dbg, regionStart, regionSize, stubSize, 8);
-	std::optional<uint64_t> caveAddr;
-	if (trailingCave && runtimeBase != 0) {
-		const uint64_t fileOffset = *trailingCave - runtimeBase;
-		if (isFileRangeZero(runtimePath, fileOffset, stubSize)) {
-			caveAddr = trailingCave;
+	const uint64_t regionEnd = regionStart + regionSize;
+	const size_t chunkSize = 1ull << 20;
+	uint64_t remaining = regionSize;
+	size_t runLen = 0;
+	uint64_t runStart = regionEnd;
+	while (remaining > 0) {
+		const uint64_t readEnd = regionStart + remaining;
+		const size_t toRead = static_cast<size_t>(std::min<uint64_t>(chunkSize, remaining));
+		const uint64_t readStart = readEnd - toRead;
+		std::vector<unsigned char> buffer(toRead);
+		if (!dbg.readMemoryQuiet(readStart, buffer.data(), buffer.size())) {
+			break;
 		}
-	}
-	if (!caveAddr) {
-		auto candidate = findZeroCaveInRegion(dbg, regionStart, regionSize, helperAddr, stubSize, 8);
-		while (candidate && runtimeBase != 0) {
-			const uint64_t fileOffset = *candidate - runtimeBase;
-			if (isFileRangeZero(runtimePath, fileOffset, stubSize)) {
-				caveAddr = candidate;
+		for (size_t idx = 0; idx < buffer.size(); ++idx) {
+			const size_t revIndex = buffer.size() - 1 - idx;
+			if (buffer[revIndex] == 0) {
+				runLen++;
+				runStart = readStart + revIndex;
+			} else {
+				remaining = 0;
 				break;
 			}
-			const uint64_t nextStart = *candidate + 8;
-			candidate = findZeroCaveInRegion(dbg, regionStart, regionSize, nextStart, stubSize, 8);
 		}
-		if (!caveAddr && candidate) {
-			caveAddr = candidate;
+		if (remaining != 0) {
+			remaining -= toRead;
 		}
 	}
-	if (!caveAddr) {
-		fprintf(stderr, "%s: Failed to locate executable code cave for inline helper hook.\n", tag);
-		return false;
+	if (runLen == 0) {
+		return std::nullopt;
 	}
-	const uint64_t stubAddr = *caveAddr;
+	return TrailingZeroRun{runStart, regionEnd, runLen};
+}
 
-	uint32_t originalInstr0 = 0;
-	uint32_t originalInstr1 = 0;
-	uint32_t originalInstr2 = 0;
-	uint32_t originalInstr3 = 0;
-	uint32_t originalInstr4 = 0;
-	if (!dbg.readMemory(helperAddr, &originalInstr0, sizeof(originalInstr0))) {
-		fprintf(stderr, "%s: Failed to read helper prologue for inline hook.\n", tag);
-		return false;
-	}
-	if (!dbg.readMemory(helperAddr + sizeof(uint32_t), &originalInstr1, sizeof(originalInstr1))) {
-		fprintf(stderr, "%s: Failed to read helper prologue for inline hook.\n", tag);
-		return false;
-	}
-	if (!dbg.readMemory(helperAddr + 2 * sizeof(uint32_t), &originalInstr2, sizeof(originalInstr2))) {
-		fprintf(stderr, "%s: Failed to read helper prologue for inline hook.\n", tag);
-		return false;
-	}
-	if (!dbg.readMemory(helperAddr + 3 * sizeof(uint32_t), &originalInstr3, sizeof(originalInstr3))) {
-		fprintf(stderr, "%s: Failed to read helper prologue for inline hook.\n", tag);
-		return false;
-	}
-	if (!dbg.readMemory(helperAddr + 4 * sizeof(uint32_t), &originalInstr4, sizeof(originalInstr4))) {
-		fprintf(stderr, "%s: Failed to read helper prologue for inline hook.\n", tag);
+enum class InlineHelperHookKind {
+	Syscall,
+	Resolve,
+};
+
+static bool installHelperInlineHookAt(MuhDebugger &dbg,
+                                      InlineHelperHookKind kind,
+                                      uint64_t helperAddr,
+                                      uint64_t stubAddr,
+                                      uint64_t payloadBaseAddr,
+                                      uint64_t payloadEntryOffset,
+                                      uint64_t stateAddr,
+                                      uint64_t runtimeExitRetAddr,
+                                      const char *label) {
+	const char *tag = label ? label : "helper";
+	if (!payloadBaseAddr) {
+		fprintf(stderr, "%s: Payload base address is 0.\n", tag);
 		return false;
 	}
 
-	uint32_t relocated0 = 0;
-	uint32_t relocated1 = 0;
-	uint32_t relocated2 = 0;
-	uint32_t relocated3 = 0;
-	uint32_t relocated4 = 0;
-	const uint64_t relocateBase = stubAddr + kHelperInlineDirectFormatOrigOffset;
-	if (!relocateInstruction(originalInstr0, helperAddr, relocateBase, relocated0) ||
-	    !relocateInstruction(originalInstr1, helperAddr + 4, relocateBase + 4, relocated1) ||
-	    !relocateInstruction(originalInstr2, helperAddr + 8, relocateBase + 8, relocated2) ||
-	    !relocateInstruction(originalInstr3, helperAddr + 12, relocateBase + 12, relocated3) ||
-	    !relocateInstruction(originalInstr4, helperAddr + 16, relocateBase + 16, relocated4)) {
-		fprintf(stderr, "%s: Failed to relocate helper prologue for inline hook.\n", tag);
-		return false;
+	uint32_t originalInstrs[5] = {};
+	for (size_t i = 0; i < 5; ++i) {
+		if (!dbg.readMemory(helperAddr + i * sizeof(uint32_t), &originalInstrs[i], sizeof(uint32_t))) {
+			fprintf(stderr, "%s: Failed to read helper entry for inline hook.\n", tag);
+			return false;
+		}
 	}
+
+	const uint64_t returnAddr = helperAddr + 20;
 
 	std::vector<uint8_t> stub;
-	if (!buildHelperInlineDirectFormatStub(relocated0, relocated1, relocated2, relocated3, relocated4,
-	                                       stubAddr, helperAddr + 20, formatBlob, formatEntryOffset, useSvcArg, stub)) {
-		fprintf(stderr, "%s: Failed to build helper inline formatted stub.\n", tag);
-		return false;
+	if (kind == InlineHelperHookKind::Syscall) {
+		if (!buildHelperSyscallInterceptStub(originalInstrs, helperAddr, stubAddr, returnAddr, payloadBaseAddr,
+		                                     payloadEntryOffset, stateAddr, runtimeExitRetAddr, true, stub)) {
+			fprintf(stderr, "%s: Failed to build syscall helper stub.\n", tag);
+			return false;
+		}
+	} else {
+		if (!buildHelperResolveMapStub(originalInstrs, helperAddr, stubAddr, returnAddr, payloadBaseAddr,
+		                               payloadEntryOffset, stateAddr, true, stub)) {
+			fprintf(stderr, "%s: Failed to build resolve helper stub.\n", tag);
+			return false;
+		}
 	}
 
 	if (!dbg.adjustMemoryProtection(stubAddr, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, stub.size())) {
@@ -1140,7 +1426,7 @@ static bool setupHelperInlineHook(MuhDebugger &dbg,
 		return false;
 	}
 
-	hookLog("%s inline stub at 0x%llx\n", tag, static_cast<unsigned long long>(stubAddr));
+	hookLog("%s inline stub at 0x%llx (%zu bytes)\n", tag, static_cast<unsigned long long>(stubAddr), stub.size());
 	return true;
 }
 
@@ -1151,12 +1437,20 @@ int main(int argc, char *argv[]) {
 	}
 
 	logsEnabled = getenv("ASTROWINE_LOGS");
-	const bool inlineHelperHook = getenv("ASTROWINE_HELPER_INLINE") != nullptr;
-	const bool inlineCStubRequested = getenv("ASTROWINE_HELPER_INLINE_C") != nullptr;
+	const bool inlineHelperHook = envFlagEnabled("ASTROWINE_HELPER_INLINE", true);
+	const bool inlineCStubRequested = envFlagEnabled("ASTROWINE_HELPER_INLINE_C", true);
 	const char *inlineCPathEnv = getenv("ASTROWINE_HELPER_INLINE_C_PATH");
+	const bool payloadLogSyscall = envFlagEnabled("ASTROWINE_PAYLOAD_LOG_SYSCALL", false);
+	const bool payloadLogResolve = envFlagEnabled("ASTROWINE_PAYLOAD_LOG_RESOLVE", false);
+	const bool payloadIntercept = envFlagEnabled("ASTROWINE_SYSCALL_INTERCEPT", true);
+	const bool payloadWineShm = envFlagEnabled("ASTROWINE_WINE_SHM", true);
+	const bool waitChild = envFlagEnabled("ASTROWINE_WAIT_CHILD", false);
+	const char *nativeThresholdEnv = getenv("ASTROWINE_NATIVE_THRESHOLD_X86");
 
 	if (!inlineHelperHook || !inlineCStubRequested) {
-		fprintf(stderr, "ASTROWINE_HELPER_INLINE=1 and ASTROWINE_HELPER_INLINE_C=1 are required.\n");
+		LOG("Hooks disabled by env, forwarding directly to target.\n");
+		execv(argv[1], &argv[1]);
+		perror("execv");
 		return 1;
 	}
 
@@ -1221,6 +1515,79 @@ int main(int argc, char *argv[]) {
 	const uint64_t helperResolveAddr = runtimeBase + offsetFinder.offsetHelperResolveAddr_;
 	LOG("helper_resolve address: 0x%llx\n", static_cast<unsigned long long>(helperResolveAddr));
 
+	auto runtimeExitRetSectionOffset = []() -> std::optional<uint64_t> {
+		const char *path = "/usr/libexec/rosetta/runtime";
+		mach_header_64 header{};
+		if (!readFileAt(path, 0, &header, sizeof(header))) return std::nullopt;
+		if (header.magic != MH_MAGIC_64 || header.ncmds == 0 || header.sizeofcmds == 0) return std::nullopt;
+		std::vector<uint8_t> cmds(header.sizeofcmds);
+		if (!readFileAt(path, sizeof(header), cmds.data(), cmds.size())) return std::nullopt;
+		size_t offset = 0;
+		for (uint32_t i = 0; i < header.ncmds && offset + sizeof(load_command) <= cmds.size(); ++i) {
+			const auto *cmd = reinterpret_cast<const load_command *>(cmds.data() + offset);
+			if (cmd->cmdsize < sizeof(load_command) || offset + cmd->cmdsize > cmds.size()) return std::nullopt;
+			if (cmd->cmd == LC_SEGMENT_64 && cmd->cmdsize >= sizeof(segment_command_64)) {
+				const auto *seg = reinterpret_cast<const segment_command_64 *>(cmd);
+				const auto *sect = reinterpret_cast<const section_64 *>(seg + 1);
+				for (uint32_t s = 0; s < seg->nsects; ++s) {
+					if (reinterpret_cast<const uint8_t *>(sect + 1) > cmds.data() + offset + cmd->cmdsize) return std::nullopt;
+					if (strncmp(sect->sectname, "runtime_exit_ret", sizeof(sect->sectname)) == 0) {
+						return sect->addr;
+					}
+					++sect;
+				}
+			}
+			offset += cmd->cmdsize;
+		}
+		return std::nullopt;
+	}();
+
+	auto runtimeTextUsedEndOffset = []() -> std::optional<uint64_t> {
+		const char *path = "/usr/libexec/rosetta/runtime";
+		mach_header_64 header{};
+		if (!readFileAt(path, 0, &header, sizeof(header))) return std::nullopt;
+		if (header.magic != MH_MAGIC_64 || header.ncmds == 0 || header.sizeofcmds == 0) return std::nullopt;
+		std::vector<uint8_t> cmds(header.sizeofcmds);
+		if (!readFileAt(path, sizeof(header), cmds.data(), cmds.size())) return std::nullopt;
+		uint64_t usedEnd = 0;
+		size_t offset = 0;
+		for (uint32_t i = 0; i < header.ncmds && offset + sizeof(load_command) <= cmds.size(); ++i) {
+			const auto *cmd = reinterpret_cast<const load_command *>(cmds.data() + offset);
+			if (cmd->cmdsize < sizeof(load_command) || offset + cmd->cmdsize > cmds.size()) return std::nullopt;
+			if (cmd->cmd == LC_SEGMENT_64 && cmd->cmdsize >= sizeof(segment_command_64)) {
+				const auto *seg = reinterpret_cast<const segment_command_64 *>(cmd);
+				if (strncmp(seg->segname, "__TEXT", sizeof(seg->segname)) != 0) {
+					offset += cmd->cmdsize;
+					continue;
+				}
+				const auto *sect = reinterpret_cast<const section_64 *>(seg + 1);
+				for (uint32_t s = 0; s < seg->nsects; ++s) {
+					if (reinterpret_cast<const uint8_t *>(sect + 1) > cmds.data() + offset + cmd->cmdsize) return std::nullopt;
+					const uint64_t end = sect->addr + sect->size;
+					if (end > usedEnd) usedEnd = end;
+					++sect;
+				}
+			}
+			offset += cmd->cmdsize;
+		}
+		if (usedEnd == 0) return std::nullopt;
+		return usedEnd;
+	}();
+
+	uint64_t runtimeExitRetAddr = 0;
+	if (runtimeExitRetSectionOffset) {
+		runtimeExitRetAddr = runtimeBase + *runtimeExitRetSectionOffset;
+		LOG("runtime_exit_ret address: 0x%llx\n", static_cast<unsigned long long>(runtimeExitRetAddr));
+	} else {
+		// Fallback for unexpected runtime layouts.
+		runtimeExitRetAddr = runtimeBase + 0x22400;
+		LOG("runtime_exit_ret address (fallback): 0x%llx\n", static_cast<unsigned long long>(runtimeExitRetAddr));
+	}
+
+	if (runtimeTextUsedEndOffset) {
+		LOG("__TEXT used end offset: 0x%llx\n", static_cast<unsigned long long>(*runtimeTextUsedEndOffset));
+	}
+
 	std::string blobPath;
 	if (inlineCPathEnv && *inlineCPathEnv) {
 		blobPath = inlineCPathEnv;
@@ -1247,12 +1614,231 @@ int main(int argc, char *argv[]) {
 	    static_cast<unsigned long long>(inlineSyscallOffset),
 	    static_cast<unsigned long long>(inlineResolveOffset));
 
-	if (!setupHelperInlineHook(dbg, helperSyscallAddr, runtimeBase, inlineFormatBlob, inlineSyscallOffset, true, "helper_syscall")) {
+	// Allocate all executable code (2 helper stubs + C payload blob) from a single trailing-zero run
+	// in Rosetta runtime's executable mapping. This avoids "last cave wins" fragmentation.
+	uint64_t payloadBaseAddr = 0;
+	uint64_t helperSyscallStubAddr = 0;
+	uint64_t helperResolveStubAddr = 0;
+	{
+		const char *runtimePath = "/usr/libexec/rosetta/runtime";
+		const size_t blobSize = inlineFormatBlob.size();
+
+		// Size pass: build stubs with no relocation so we know how much space to reserve.
+		uint32_t dummyInstrs[5] = {};
+		std::vector<uint8_t> syscallSizeStub;
+		std::vector<uint8_t> resolveSizeStub;
+		const uint64_t dummyStubAddr = 0;
+		const uint64_t dummyPayloadBase = 0x1000;
+		const uint64_t dummyStateAddr = 0;
+		if (!buildHelperSyscallInterceptStub(dummyInstrs, helperSyscallAddr, dummyStubAddr, helperSyscallAddr + 20,
+		                                     dummyPayloadBase, inlineSyscallOffset, dummyStateAddr, runtimeExitRetAddr,
+		                                     false, syscallSizeStub)) {
+			fprintf(stderr, "payload: Failed to build syscall stub for sizing.\n");
+			dbg.detach();
+			return 1;
+		}
+		if (!buildHelperResolveMapStub(dummyInstrs, helperResolveAddr, dummyStubAddr, helperResolveAddr + 20,
+		                               dummyPayloadBase, inlineResolveOffset, dummyStateAddr, false, resolveSizeStub)) {
+			fprintf(stderr, "payload: Failed to build resolve stub for sizing.\n");
+			dbg.detach();
+			return 1;
+		}
+
+		mach_vm_address_t regionStart = 0;
+		mach_vm_size_t regionSize = 0;
+		vm_prot_t regionProt = 0;
+		if (!findExecRegionForAddress(dbg, helperSyscallAddr, regionStart, regionSize, regionProt)) {
+			fprintf(stderr, "payload: Failed to locate executable region for payload/stubs.\n");
+			dbg.detach();
+			return 1;
+		}
+
+		const auto trailingRun = findTrailingZeroRunInRegion(dbg, regionStart, regionSize);
+		if (!trailingRun) {
+			fprintf(stderr, "payload: Failed to locate a trailing zero run in executable runtime region.\n");
+			dbg.detach();
+			return 1;
+		}
+
+		const uint64_t runStart = trailingRun->start;
+		const uint64_t runEnd = trailingRun->end;
+		uint64_t front = runStart;
+		if (runtimeTextUsedEndOffset && runtimeBase != 0) {
+			const uint64_t safeMinAddr = runtimeBase + *runtimeTextUsedEndOffset;
+			if (safeMinAddr > front) front = safeMinAddr;
+		}
+		front = alignUp(front, 8);
+		uint64_t back = runEnd;
+
+		auto allocFront = [&](size_t size, uint64_t &outAddr) -> bool {
+			const uint64_t addr = alignUp(front, 8);
+			if (addr + size > back) return false;
+			outAddr = addr;
+			front = addr + size;
+			return true;
+		};
+		auto allocBack = [&](size_t size, uint64_t &outAddr) -> bool {
+			const uint64_t addr = alignDown(back - size, 8);
+			if (addr < front) return false;
+			outAddr = addr;
+			back = addr;
+			return true;
+		};
+
+		if (!allocFront(syscallSizeStub.size(), helperSyscallStubAddr)) {
+			fprintf(stderr, "payload: Not enough trailing-zero space for helper_syscall stub.\n");
+			dbg.detach();
+			return 1;
+		}
+		if (!allocFront(resolveSizeStub.size(), helperResolveStubAddr)) {
+			fprintf(stderr, "payload: Not enough trailing-zero space for helper_resolve stub.\n");
+			dbg.detach();
+			return 1;
+		}
+		if (!allocBack(blobSize, payloadBaseAddr)) {
+			fprintf(stderr, "payload: Not enough trailing-zero space for payload blob.\n");
+			dbg.detach();
+			return 1;
+		}
+
+		auto ensureFileZero = [&](const char *what, uint64_t addr, size_t size) -> bool {
+			if (runtimeBase == 0) return true;
+			if (addr < runtimeBase) return false;
+			const uint64_t fileOffset = addr - runtimeBase;
+			if (!isFileRangeZero(runtimePath, fileOffset, size)) {
+				fprintf(stderr, "%s: Target range is not file-zero (addr 0x%llx file_off 0x%llx size %zu)\n",
+				        what,
+				        static_cast<unsigned long long>(addr),
+				        static_cast<unsigned long long>(fileOffset),
+				        size);
+				return false;
+			}
+			return true;
+		};
+
+		if (!ensureFileZero("payload", payloadBaseAddr, blobSize) ||
+		    !ensureFileZero("helper_syscall", helperSyscallStubAddr, syscallSizeStub.size()) ||
+		    !ensureFileZero("helper_resolve", helperResolveStubAddr, resolveSizeStub.size())) {
+			dbg.detach();
+			return 1;
+		}
+
+		if (!dbg.adjustMemoryProtection(payloadBaseAddr, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, blobSize)) {
+			fprintf(stderr, "payload: Failed to adjust protection for payload blob.\n");
+			dbg.detach();
+			return 1;
+		}
+		if (!dbg.writeMemory(payloadBaseAddr, inlineFormatBlob.data(), inlineFormatBlob.size())) {
+			fprintf(stderr, "payload: Failed to write payload blob.\n");
+			dbg.detach();
+			return 1;
+		}
+		(void)dbg.flushInstructionCache(payloadBaseAddr, blobSize);
+		if (!dbg.adjustMemoryProtection(payloadBaseAddr, VM_PROT_READ | VM_PROT_EXECUTE, blobSize)) {
+			fprintf(stderr, "payload: Failed to restore protection for payload blob.\n");
+			dbg.detach();
+			return 1;
+		}
+
+		hookLog("payload blob at 0x%llx (%zu bytes)\n",
+		        static_cast<unsigned long long>(payloadBaseAddr),
+		        blobSize);
+		hookLog("helper_syscall stub reserved at 0x%llx (%zu bytes)\n",
+		        static_cast<unsigned long long>(helperSyscallStubAddr),
+		        syscallSizeStub.size());
+		hookLog("helper_resolve stub reserved at 0x%llx (%zu bytes)\n",
+		        static_cast<unsigned long long>(helperResolveStubAddr),
+		        resolveSizeStub.size());
+	}
+
+	// Allocate and initialize the payload state in the target process.
+	uint64_t stateAddr = 0;
+	{
+		const char *stateSizeEnv = getenv("ASTROWINE_STATE_SIZE");
+		const uint64_t stateSize = stateSizeEnv ? strtoull(stateSizeEnv, nullptr, 0) : 0x200000;
+		mach_vm_address_t addr = 0;
+		kern_return_t kr = KERN_FAILURE;
+
+		// Rosetta runtime wants to reserve large contiguous regions for AOT/JIT mappings.
+		// Avoid fragmenting low address space by defaulting to a high fixed mapping.
+		const char *stateAddrEnv = getenv("ASTROWINE_STATE_ADDR");
+		if (stateAddrEnv && *stateAddrEnv) {
+			addr = static_cast<mach_vm_address_t>(strtoull(stateAddrEnv, nullptr, 0));
+			kr = mach_vm_allocate(dbg.taskPort(), &addr, stateSize, VM_FLAGS_FIXED);
+			if (kr != KERN_SUCCESS) {
+				fprintf(stderr, "Failed to allocate fixed state memory at 0x%llx (error 0x%x: %s)\n",
+				        static_cast<unsigned long long>(addr), kr, mach_error_string(kr));
+				dbg.detach();
+				return 1;
+			}
+		} else {
+			const uint64_t candidates[] = {
+				0x700000000000ull,
+				0x6f0000000000ull,
+				0x600000000000ull,
+				0x500000000000ull,
+				0x400000000000ull,
+			};
+			bool allocated = false;
+			for (const auto base : candidates) {
+				addr = static_cast<mach_vm_address_t>(base);
+				kr = mach_vm_allocate(dbg.taskPort(), &addr, stateSize, VM_FLAGS_FIXED);
+				if (kr == KERN_SUCCESS) {
+					allocated = true;
+					break;
+				}
+			}
+			if (!allocated) {
+				addr = 0;
+				kr = mach_vm_allocate(dbg.taskPort(), &addr, stateSize, VM_FLAGS_ANYWHERE);
+			}
+			if (kr != KERN_SUCCESS) {
+				fprintf(stderr, "Failed to allocate state memory in target (error 0x%x: %s)\n", kr, mach_error_string(kr));
+				dbg.detach();
+				return 1;
+			}
+		}
+		stateAddr = addr;
+		AstroWineStateHeader header{};
+		header.magic = kAstroWineStateMagic;
+		header.version = kAstroWineStateVersion;
+		header.lock = 0;
+		header.count = 0;
+		const uint64_t available = stateSize > sizeof(header) ? (stateSize - sizeof(header)) : 0;
+		const uint64_t perEntry = sizeof(uint64_t) * 2 + sizeof(uint8_t);
+		const uint64_t cap = perEntry ? (available / perEntry) : 0;
+		header.capacity = cap > 0xffffffffu ? 0xffffffffu : static_cast<uint32_t>(cap);
+		// 0 uses seccomp-like address filtering; non-zero forces a simple < threshold policy.
+		header.native_threshold_x86 = (nativeThresholdEnv && *nativeThresholdEnv)
+		                                  ? strtoull(nativeThresholdEnv, nullptr, 0)
+		                                  : 0;
+		header.wine_shm_ptr = payloadWineShm ? kAstroWineWineShmPtrDefault : 0;
+		header.flags = 0;
+		if (payloadLogSyscall) header.flags |= ASTROWINE_STATE_FLAG_LOG_SYSCALL;
+		if (payloadLogResolve) header.flags |= ASTROWINE_STATE_FLAG_LOG_RESOLVE;
+		if (payloadIntercept) header.flags |= ASTROWINE_STATE_FLAG_INTERCEPT;
+		if (!dbg.writeMemory(stateAddr, &header, sizeof(header))) {
+			fprintf(stderr, "Failed to initialize state header in target.\n");
+			dbg.detach();
+			return 1;
+		}
+		LOG("payload state at 0x%llx (size 0x%llx cap %u flags 0x%x wine_shm %s threshold 0x%llx)\n",
+		    static_cast<unsigned long long>(stateAddr),
+		    static_cast<unsigned long long>(stateSize),
+		    header.capacity,
+		    header.flags,
+		    header.wine_shm_ptr ? "on" : "off",
+		    static_cast<unsigned long long>(header.native_threshold_x86));
+	}
+
+	if (!installHelperInlineHookAt(dbg, InlineHelperHookKind::Syscall, helperSyscallAddr, helperSyscallStubAddr,
+	                               payloadBaseAddr, inlineSyscallOffset, stateAddr, runtimeExitRetAddr, "helper_syscall")) {
 		fprintf(stderr, "Inline helper_syscall hook failed.\n");
 		dbg.detach();
 		return 1;
 	}
-	if (!setupHelperInlineHook(dbg, helperResolveAddr, runtimeBase, inlineFormatBlob, inlineResolveOffset, false, "helper_resolve")) {
+	if (!installHelperInlineHookAt(dbg, InlineHelperHookKind::Resolve, helperResolveAddr, helperResolveStubAddr,
+	                               payloadBaseAddr, inlineResolveOffset, stateAddr, runtimeExitRetAddr, "helper_resolve")) {
 		fprintf(stderr, "Inline helper_resolve hook failed.\n");
 		dbg.detach();
 		return 1;
@@ -1261,6 +1847,11 @@ int main(int argc, char *argv[]) {
 	if (!dbg.detach()) {
 		fprintf(stderr, "Failed to detach debugger\n");
 		return 1;
+	}
+
+	if (waitChild) {
+		int status = 0;
+		(void)waitpid(child, &status, 0);
 	}
 
 	return 0;
