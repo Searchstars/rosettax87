@@ -894,6 +894,8 @@ static bool buildHelperResolveMapStub(uint32_t originalInstrs[5],
 	}
 	instrs.push_back(encodeLdrImm(2, 31, 0x08)); // x2 = saved x1 (x86 addr)
 	instrs.push_back(encodeLdrImm(3, 31, 0x00)); // x3 = saved x0 (arm addr)
+	instrs.push_back(encodeAddImm(4, 22, 0));    // x4 = live x22 (candidate x86 addr in helper context)
+	instrs.push_back(encodeAddImm(5, 23, 0));    // x5 = live x23 (stub section base / alt candidate)
 
 	const size_t payloadAddrIdx = instrs.size();
 	instrs.push_back(0); // movz x16, ...
@@ -1660,15 +1662,23 @@ int main(int argc, char *argv[]) {
 			return 1;
 		}
 
-		const uint64_t runStart = trailingRun->start;
-		const uint64_t runEnd = trailingRun->end;
-		uint64_t front = runStart;
-		if (runtimeTextUsedEndOffset && runtimeBase != 0) {
-			const uint64_t safeMinAddr = runtimeBase + *runtimeTextUsedEndOffset;
-			if (safeMinAddr > front) front = safeMinAddr;
-		}
-		front = alignUp(front, 8);
-		uint64_t back = runEnd;
+			const uint64_t runStart = trailingRun->start;
+			const uint64_t runEnd = trailingRun->end;
+			uint64_t front = runStart;
+			if (runtimeTextUsedEndOffset && runtimeBase != 0) {
+				const uint64_t safeMinAddr = runtimeBase + *runtimeTextUsedEndOffset;
+				if (safeMinAddr > front) front = safeMinAddr;
+			}
+			front = alignUp(front, 8);
+			uint64_t back = runEnd;
+			LOG("runtime trailing-zero run: [0x%llx, 0x%llx) len=0x%zx, front=0x%llx, need blob=0x%zx syscall_stub=0x%zx resolve_stub=0x%zx\n",
+			    static_cast<unsigned long long>(runStart),
+			    static_cast<unsigned long long>(runEnd),
+			    trailingRun->length,
+			    static_cast<unsigned long long>(front),
+			    blobSize,
+			    syscallSizeStub.size(),
+			    resolveSizeStub.size());
 
 		auto allocFront = [&](size_t size, uint64_t &outAddr) -> bool {
 			const uint64_t addr = alignUp(front, 8);
@@ -1695,11 +1705,11 @@ int main(int argc, char *argv[]) {
 			dbg.detach();
 			return 1;
 		}
-		if (!allocBack(blobSize, payloadBaseAddr)) {
-			fprintf(stderr, "payload: Not enough trailing-zero space for payload blob.\n");
-			dbg.detach();
-			return 1;
-		}
+			if (!allocBack(blobSize, payloadBaseAddr)) {
+				fprintf(stderr, "payload: Not enough trailing-zero space for payload blob.\n");
+				dbg.detach();
+				return 1;
+			}
 
 		auto ensureFileZero = [&](const char *what, uint64_t addr, size_t size) -> bool {
 			if (runtimeBase == 0) return true;
@@ -1716,12 +1726,12 @@ int main(int argc, char *argv[]) {
 			return true;
 		};
 
-		if (!ensureFileZero("payload", payloadBaseAddr, blobSize) ||
-		    !ensureFileZero("helper_syscall", helperSyscallStubAddr, syscallSizeStub.size()) ||
-		    !ensureFileZero("helper_resolve", helperResolveStubAddr, resolveSizeStub.size())) {
-			dbg.detach();
-			return 1;
-		}
+			if (!ensureFileZero("payload", payloadBaseAddr, blobSize) ||
+			    !ensureFileZero("helper_syscall", helperSyscallStubAddr, syscallSizeStub.size()) ||
+			    !ensureFileZero("helper_resolve", helperResolveStubAddr, resolveSizeStub.size())) {
+				dbg.detach();
+				return 1;
+			}
 
 		if (!dbg.adjustMemoryProtection(payloadBaseAddr, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, blobSize)) {
 			fprintf(stderr, "payload: Failed to adjust protection for payload blob.\n");

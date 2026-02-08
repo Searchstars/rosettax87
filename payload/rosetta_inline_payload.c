@@ -77,12 +77,31 @@ static inline __attribute__((always_inline)) uint64_t sys_pthread_kill(uint64_t 
 	return r0;
 }
 
-static inline __attribute__((always_inline)) uint64_t current_pthread_kill_id(void) {
-	/* libpthread stores the kernel thread id used by __pthread_kill at
-	 * (pthread_self + 0xf8). On arm64 macOS, pthread_self is TPIDRRO_EL0 - 0xe0,
-	 * so the id sits at TPIDRRO_EL0 + 0x18. */
+static inline __attribute__((always_inline)) uint64_t sys_pthread_sigmask(uint64_t how, const void *set, void *oset) {
+	register uint64_t r0 asm("x0") = how;
+	register uint64_t r1 asm("x1") = (uint64_t)set;
+	register uint64_t r2 asm("x2") = (uint64_t)oset;
+	register uint64_t r16 asm("x16") = 329; // SYS___pthread_sigmask
+	__asm__ volatile("svc #0x80"
+	                 : "+r"(r0)
+	                 : "r"(r1), "r"(r2), "r"(r16)
+	                 : "memory", "x3", "x4", "x5", "x6", "x7");
+	return r0;
+}
+
+static inline __attribute__((always_inline)) uint64_t current_tpidrro_el0(void) {
 	uint64_t tpidrro = 0;
 	__asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tpidrro));
+	return tpidrro;
+}
+
+static inline __attribute__((always_inline)) uint64_t current_pthread_self_ptr(void) {
+	const uint64_t tpidrro = current_tpidrro_el0();
+	return tpidrro - 0xe0u;
+}
+
+static inline __attribute__((always_inline)) uint64_t current_pthread_kill_id(void) {
+	const uint64_t tpidrro = current_tpidrro_el0();
 	return *(volatile uint32_t *)(uintptr_t)(tpidrro + 0x18u);
 }
 
@@ -124,8 +143,19 @@ struct AstroWineWineShm {
 	/* pending states:
 	 * 0 = idle, 1 = ready for Wine handler, 2 = write-locked by payload */
 	volatile uint32_t pending;
+	volatile uint32_t result_ready;
+	uint32_t _pad_result;
+	uint32_t _pad_result2;
 	uint64_t syscall_nr;
 	uint64_t syscall_rip;
+	uint64_t result_rax;
+	uint64_t sender_pthread_self;
+	uint64_t sender_pthread_teb;
+	uint64_t sender_thread_selfid;
+	uint64_t sender_pthread_kill_id;
+	uint64_t sender_unmask_result;
+	uint64_t sender_raise_stage;
+	uint64_t sender_raise_result;
 	/* Register snapshot for Wine's SIGSYS handler override. */
 	uint64_t rbx;
 	uint64_t rdx;
@@ -221,28 +251,30 @@ static inline __attribute__((always_inline)) uint32_t find_floor_index_u64(const
 	return lo - 1;
 }
 
+static inline __attribute__((always_inline)) int is_plausible_x86_rip(uint64_t rip) {
+	if (rip < 0x10000ull) return 0;
+	if (rip >= 0x800000000000ull) return 0;
+	return 1;
+}
+
 /* Mirror Wine's Linux seccomp address policy for trapping x86 syscalls:
  * 1) trap low addresses (< 0x700000000000), except wine64-preloader window.
- * 2) in high addresses, only trap top-down allocation window 0x7fff:fe000000..fffeffff. */
+ * 2) in high addresses, trap common user windows (0x7ff0..0x7fff),
+ *    with Linux top-down range retained for 0x7fff. */
 static inline __attribute__((always_inline)) int should_trap_x86_rip_like_seccomp(uint64_t rip) {
-	if (!rip) {
-		return 0;
-	}
+	if (!rip) return 0;
 
 	const uint32_t hi = (uint32_t)(rip >> 32);
 	const uint32_t lo = (uint32_t)rip;
 
-	if (hi > 0x7000u) {
-		if (hi != 0x7fffu) {
-			return 0;
+	if (hi >= 0x7ff0u) {
+		if (hi == 0x7fffu) {
+			if (lo < 0xfe000000u) return 0;
+			if (lo >= 0xffff0000u) return 0;
+			return 1;
 		}
-		if (lo < 0xfe000000u) {
-			return 0;
-		}
-		if (lo >= 0xffff0000u) {
-			return 0;
-		}
-		return 1;
+		if (hi <= 0x7fffu) return 1;
+		return 0;
 	}
 
 	/* Allow wine64-preloader shim window. */
@@ -303,8 +335,7 @@ uint64_t rosetta_helper_syscall_inline(char *out,
 		return 0;
 	}
 
-	// Fast path: Darwin x86_64 syscalls always include a syscall class in the upper bits
-	// (e.g. 0x2000000 for UNIX). Windows syscall numbers are typically small (class==0).
+	// Darwin x86_64 syscalls include a class in upper bits; Windows direct syscalls are typically class 0.
 	const uint32_t syscall_class = (uint32_t)((sysnum & 0x07000000u) >> 24);
 	if (syscall_class != 0) {
 		if (st->flags & ASTROWINE_STATE_FLAG_LOG_SYSCALL) {
@@ -315,9 +346,11 @@ uint64_t rosetta_helper_syscall_inline(char *out,
 
 	uint64_t arm_func = 0;
 	uint64_t x86_func = 0;
-	uint8_t interceptable = 0;
-	const uint64_t *regs = (const uint64_t *)(uintptr_t)regs_ptr;
-	const uint64_t x86_rcx_rip = regs ? regs[1] : 0;
+	uint8_t mapped_interceptable = 1;
+	uint8_t have_mapping = 0;
+	uint64_t *regs = (uint64_t *)(uintptr_t)regs_ptr;
+	if (!regs) return 0;
+	const uint64_t x86_rcx_rip = regs[1];
 
 	spin_lock(&st->lock);
 	const uint32_t count = st->count;
@@ -329,37 +362,68 @@ uint64_t rosetta_helper_syscall_inline(char *out,
 		if (idx != 0xffffffffu) {
 			arm_func = arm[idx];
 			x86_func = x86[idx];
-			interceptable = flags[idx];
+			mapped_interceptable = flags[idx];
+			have_mapping = 1;
 		}
 	}
 	spin_unlock(&st->lock);
 
-	/* Use the exact x86 trap site (RCX semantics of SYSCALL) whenever available.
-	 * The arm->x86 function floor mapping can resolve to a wrapper thunk. */
-	const uint64_t x86_site = x86_rcx_rip ? x86_rcx_rip : x86_func;
-	const uint64_t threshold = st->native_threshold_x86;
-	int should_intercept = 0;
-	if ((st->flags & ASTROWINE_STATE_FLAG_INTERCEPT) && interceptable) {
-		/* Keep threshold override for experiments; otherwise use seccomp-like trap policy. */
-		should_intercept = threshold ? (x86_site != 0 && x86_site < threshold)
-		                             : should_trap_x86_rip_like_seccomp(x86_site);
+	uint64_t x86_site = 0;
+	if (is_plausible_x86_rip(x86_rcx_rip)) {
+		x86_site = x86_rcx_rip;
+	} else if (is_plausible_x86_rip(x86_func)) {
+		x86_site = x86_func;
 	}
 
+	const uint64_t threshold = st->native_threshold_x86;
+	int should_intercept = 0;
+	if (st->flags & ASTROWINE_STATE_FLAG_INTERCEPT) {
+		if (threshold) {
+			should_intercept = (x86_site != 0 && x86_site < threshold);
+		} else if (!have_mapping || mapped_interceptable) {
+			should_intercept = should_trap_x86_rip_like_seccomp(x86_site);
+		}
+	}
 	if (!should_intercept || st->wine_shm_ptr == 0) {
 		maybe_log_syscall(out, st, sysnum, lr, arm_func, x86_site, "syscall(skip)");
 		return 0;
 	}
 
-	// Communicate syscall info to Wine via a fixed shared struct, then raise SIGSYS.
+	/* Communicate syscall info to Wine via a fixed shared struct.
+	 *
+	 * IMPORTANT: Do not raise SIGSYS from this injected runtime code.
+	 * Rosetta's signal/PC classification can assert if the signal is delivered while PC
+	 * is inside our code-cave fragment. Instead, we let Rosetta's original helper
+	 * execute and trigger SIGSYS from within Rosetta runtime code (a known fragment),
+	 * and use the shared struct to override the trap context in Wine's sigsys handler.
+	 */
 	struct AstroWineWineShm *shm = (struct AstroWineWineShm *)(uintptr_t)st->wine_shm_ptr;
 	if (!claim_wine_shm_slot(&shm->pending)) {
 		maybe_log_syscall(out, st, sysnum, lr, arm_func, x86_site, "syscall(shm-busy)");
 		return 0;
 	}
 
+	const uint64_t tpidrro = current_tpidrro_el0();
+	const uint64_t tid_selfid = sys_thread_selfid();
+	uint32_t sigset[4] = {0, 0, 0, 0};
+	sigset[(12u - 1u) / 32u] = 1u << ((12u - 1u) % 32u); /* SIGSYS = 12 */
+	const uint64_t unmask_result = sys_pthread_sigmask(2 /* SIG_UNBLOCK */, sigset, 0);
+
 	shm->syscall_nr = sysnum;
-	/* Preserve a seccomp-like trap site whenever possible. */
-	shm->syscall_rip = x86_site;
+	/* Let Rosetta/kernel provide the trap RIP. Overriding RIP from our heuristics
+	 * can be actively harmful (wrong return-to address) when the SIGSYS is generated
+	 * synchronously by the helper's svc. */
+	shm->syscall_rip = 0;
+	shm->result_rax = 0;
+	__atomic_store_n((uint32_t *)&shm->result_ready, 0u, __ATOMIC_RELEASE);
+	shm->sender_pthread_self = current_pthread_self_ptr();
+	shm->sender_pthread_teb = tpidrro;
+	shm->sender_thread_selfid = tid_selfid;
+	shm->sender_pthread_kill_id = current_pthread_kill_id();
+	shm->sender_unmask_result = unmask_result;
+	shm->sender_raise_stage = 0;
+	shm->sender_raise_result = 0;
+
 	/* x86_64 -> arm64 register mapping (Rosetta2):
 	 * x0..x15 correspond to RAX..R15. */
 	shm->rbx = regs[3];
@@ -375,52 +439,44 @@ uint64_t rosetta_helper_syscall_inline(char *out,
 	shm->r13 = regs[13];
 	shm->r14 = regs[14];
 	shm->r15 = regs[15];
+	
 	dmb_ish();
 	__atomic_store_n((uint32_t *)&shm->pending, 1u, __ATOMIC_RELEASE);
 
-	maybe_log_syscall(out, st, sysnum, lr, arm_func, x86_func, "syscall(TRAP)");
+	maybe_log_syscall(out, st, sysnum, lr, arm_func, x86_site, "syscall(SHM)");
 
-	const uint64_t tid = current_pthread_kill_id();
-	uint64_t raise_result = (uint64_t)-1;
-	if (tid != 0) {
-		raise_result = sys_pthread_kill(tid, 12 /* SIGSYS */);
-	}
-	if (raise_result != 0) {
-		const uint64_t tid_selfid = sys_thread_selfid();
-		if (tid_selfid != 0 && tid_selfid != (uint64_t)-1) {
-			raise_result = sys_pthread_kill(tid_selfid, 12 /* SIGSYS */);
-		}
-	}
-	if (raise_result != 0) {
-		const uint64_t pid = sys_getpid();
-		raise_result = sys_kill(pid, 12 /* SIGSYS */);
-	}
+	/* Force Rosetta helper to hit a guaranteed-invalid syscall number so the kernel
+	 * delivers SIGSYS while executing Rosetta runtime code (not our injected blob).
+	 *
+	 * Wine's sigsys handler will observe shm->pending==1 and override the trap context
+	 * (syscall nr/rip/registers) using the values we wrote above. */
+	/* Avoid 0xffff: Wine uses it as an install_bpf test syscall number. */
+	regs[0] = 0xfffeu;
 
-	/* Best effort: if signal was handled in-place, pending will be cleared by Wine handler. */
-	for (uint32_t i = 0; i < 1000000u; ++i) {
-		if (__atomic_load_n((uint32_t *)&shm->pending, __ATOMIC_ACQUIRE) == 0) {
-			break;
-		}
-	}
-	if (__atomic_load_n((uint32_t *)&shm->pending, __ATOMIC_ACQUIRE) != 0) {
-		__atomic_store_n((uint32_t *)&shm->pending, 0u, __ATOMIC_RELEASE);
-	}
-
-	// If the Wine SIGSYS handler doesn't redirect for some reason, tell the stub to skip the original helper.
-	return 1;
+	/* Continue into the original helper (do not short-circuit to runtime_exit_ret). */
+	return 0;
 }
 
 __attribute__((used, noinline))
 uint64_t rosetta_helper_resolve_inline(char *out,
                                        uint64_t state_ptr,
                                        uint64_t x86_addr,
-                                       uint64_t arm_addr) {
+                                       uint64_t arm_addr,
+                                       uint64_t x22_addr,
+                                       uint64_t x23_addr) {
 	struct AstroWineState *st = (struct AstroWineState *)(uintptr_t)state_ptr;
 	if (!st || st->magic != kAstroWineStateMagic || st->version != kAstroWineStateVersion) {
 		return 0;
 	}
 	if (x86_addr == 0 || arm_addr == 0) {
 		return 0;
+	}
+
+	uint64_t mapped_x86 = x86_addr;
+	if (is_plausible_x86_rip(x22_addr)) {
+		mapped_x86 = x22_addr;
+	} else if (!is_plausible_x86_rip(mapped_x86) && is_plausible_x86_rip(x23_addr)) {
+		mapped_x86 = x23_addr;
 	}
 
 	spin_lock(&st->lock);
@@ -432,9 +488,13 @@ uint64_t rosetta_helper_resolve_inline(char *out,
 
 	const uint32_t pos = lower_bound_u64(arm, count, arm_addr);
 	if (pos < count && arm[pos] == arm_addr) {
-		x86[pos] = x86_addr;
+		x86[pos] = mapped_x86;
 		const uint64_t threshold = st->native_threshold_x86;
-		flags[pos] = (!threshold || x86_addr < threshold) ? 1 : 0;
+		if (threshold) {
+			flags[pos] = mapped_x86 < threshold ? 1 : 0;
+		} else {
+			flags[pos] = should_trap_x86_rip_like_seccomp(mapped_x86) ? 1 : 0;
+		}
 	} else if (count < capacity) {
 		for (uint32_t i = count; i > pos; --i) {
 			arm[i] = arm[i - 1];
@@ -442,13 +502,17 @@ uint64_t rosetta_helper_resolve_inline(char *out,
 			flags[i] = flags[i - 1];
 		}
 		arm[pos] = arm_addr;
-		x86[pos] = x86_addr;
+		x86[pos] = mapped_x86;
 		const uint64_t threshold = st->native_threshold_x86;
-		flags[pos] = (!threshold || x86_addr < threshold) ? 1 : 0;
+		if (threshold) {
+			flags[pos] = mapped_x86 < threshold ? 1 : 0;
+		} else {
+			flags[pos] = should_trap_x86_rip_like_seccomp(mapped_x86) ? 1 : 0;
+		}
 		st->count = count + 1;
 	}
 	spin_unlock(&st->lock);
 
-	maybe_log_resolve(out, st, x86_addr, arm_addr, "resolve(map)");
+	maybe_log_resolve(out, st, mapped_x86, arm_addr, "resolve(map)");
 	return 0;
 }
