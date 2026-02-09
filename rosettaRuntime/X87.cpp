@@ -2068,6 +2068,46 @@ void x87_set_init_state(X87State *state) {
 }
 #endif
 
-X87_TRAMPOLINE(runtime_cpuid, x22)
+__attribute__((naked, used)) void runtime_cpuid() {
+	asm volatile(
+	    // Preserve frame/lr and keep SP 16-byte aligned.
+	    "sub sp, sp, #0x20\n"
+	    "stp x29, x30, [sp, #0x10]\n"
+	    "mov x29, sp\n"
+
+	    // Save leaf/subleaf (assumed x0/x1 input convention).
+	    "mov w9, w0\n"
+	    "mov w10, w1\n"
+
+	    // Call original Rosetta helper.
+	    "adrp x16, _orig_runtime_cpuid@PAGE\n"
+	    "ldr  x16, [x16, _orig_runtime_cpuid@PAGEOFF]\n"
+	    "blr  x16\n"
+
+	    // leaf=1: clear ECX[31] hypervisor bit (assumed x2=ECX).
+	    "cmp w9, #1\n"
+	    "b.ne 1f\n"
+	    "cmp w10, #0\n"
+	    "b.ne 1f\n"
+	    "and w2, w2, #0x7fffffff\n"
+	    "1:\n"
+
+	    // Hide hypervisor-specific leaves 0x40000000-0x40ffffff.
+	    "movz w11, #0x4000, lsl #16\n"
+	    "cmp w9, w11\n"
+	    "b.lo 2f\n"
+	    "movz w12, #0x4100, lsl #16\n"
+	    "cmp w9, w12\n"
+	    "b.hs 2f\n"
+	    "mov w0, wzr\n"
+	    "mov w1, wzr\n"
+	    "mov w2, wzr\n"
+	    "mov w3, wzr\n"
+	    "2:\n"
+
+	    "ldp x29, x30, [sp, #0x10]\n"
+	    "add sp, sp, #0x20\n"
+	    "ret\n");
+}
 X87_TRAMPOLINE(runtime_wide_udiv_64, x9)
 X87_TRAMPOLINE(runtime_wide_sdiv_64, x9)
